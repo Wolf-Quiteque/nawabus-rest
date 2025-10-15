@@ -592,6 +592,76 @@ app.post('/api/payment', async (req, res) => {
   }
 });
 
+// POST /api/users/get-or-create - Get or create a user profile
+app.post('/api/users/get-or-create', async (req, res) => {
+  try {
+    const { name, phone } = req.body;
+
+    if (!name || !phone) {
+      return res.status(400).json({ success: false, error: 'Name and phone are required' });
+    }
+
+    // 1. Search for existing profile by phone number
+    const { data: existingProfile, error: profileError } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('phone_number', phone)
+      .single();
+
+    if (profileError && profileError.code !== 'PGRST116') { // PGRST116 = no rows found
+      console.error('Error searching for profile:', profileError);
+      return res.status(500).json({ success: false, error: 'Database error' });
+    }
+
+    if (existingProfile) {
+      return res.json({ success: true, userId: existingProfile.id });
+    }
+
+    // 2. If not found, create a new user and profile
+    const email = `${phone}@nawabus.com`;
+    const password = 'luanda2025';
+    const [firstName, ...lastNameParts] = name.split(' ');
+    const lastName = lastNameParts.join(' ');
+
+    const { data: authData, error: authError } = await supabase.auth.signUp({
+      email: email,
+      password: password,
+      options: {
+        data: {
+          first_name: firstName,
+          last_name: lastName,
+          role: 'passenger',
+          phone_number: phone
+        }
+      }
+    });
+
+    if (authError) {
+      // If user already exists, try to find their profile again
+      if (authError.message.includes('already registered')) {
+        const { data: user, error: userError } = await supabase
+          .from('users')
+          .select('id')
+          .eq('email', email)
+          .single();
+
+        if (user) {
+          return res.json({ success: true, userId: user.id });
+        }
+      }
+      console.error('Error creating user:', authError);
+      return res.status(500).json({ success: false, error: authError.message });
+    }
+
+    // The trigger should create the profile, but we return the ID directly
+    res.status(201).json({ success: true, userId: authData.user.id });
+
+  } catch (error) {
+    console.error('Get or create user error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 // GET /api/health - Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
