@@ -1,0 +1,28 @@
+{
+  "name": "bus-ticket-booking-api",
+  "version": "1.0.0",
+  "description": "REST API for bus ticket booking system",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {},
+  "keywords": [
+    "bus",
+    "ticket",
+    "booking",
+    "api",
+    "rest"
+  ],
+  "author": "",
+  "license": "ISC"
+}
