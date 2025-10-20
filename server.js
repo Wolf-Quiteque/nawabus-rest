@@ -540,11 +540,12 @@ app.post('/api/booking', async (req, res) => {
       res.status(201).json({
         success: true,
         ticket: {
-          id: ticketId,
+          id: ticket.id,
           trip_id: tripId,
           seat_number: seatNumber,
           price_paid_usd: trip.price_usd,
-          qr_code_data: `TKT-${tripId}-${seatNumber}`
+          qr_code_data: `TKT-${tripId}-${seatNumber}`,
+          ticket_number: ticket.ticket_number
         }
       });
 
