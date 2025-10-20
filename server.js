@@ -410,6 +410,37 @@ app.get('/api/trips/:tripId', async (req, res) => {
   }
 });
 
+// GET /api/trips/:tripId/booked_seats - Get booked seats for a trip
+app.get('/api/trips/:tripId/booked_seats', async (req, res) => {
+  try {
+    const { tripId } = req.params;
+
+    const { data: seats, error } = await supabase
+      .from('tickets')
+      .select('seat_number')
+      .eq('trip_id', tripId)
+      .in('status', ['active', 'used', 'pending']); // Include pending and used tickets as booked
+
+    if (error) {
+      console.error('Supabase error:', error);
+      return res.status(500).json({
+        error: 'Database error',
+        details: error.message
+      });
+    }
+
+    const bookedSeats = seats.map(s => s.seat_number);
+    res.json({ booked_seats: bookedSeats });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
 // GET /api/routes - Get available routes
 app.get('/api/routes', async (req, res) => {
   try {
