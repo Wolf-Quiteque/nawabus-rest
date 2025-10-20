@@ -511,7 +511,7 @@ app.post('/api/booking', async (req, res) => {
           payment_reference: paymentReference,
           qr_code_data: `TKT-${tripId}-${seatNumber}` // Simple QR data
         })
-        .select('id')
+        .select('id, ticket_number')
         .single();
 
       if (ticketError) throw ticketError;
@@ -560,7 +560,7 @@ app.post('/api/booking', async (req, res) => {
   }
 });
 
-// POST /api/payment - Handle payment (placeholder for future payment integration)
+// POST /api/payment - Handle payment (placeholder for future payment integration)kkk
 app.post('/api/payment', async (req, res) => {
   try {
     const { amount, method, reference, ticketId } = req.body;
