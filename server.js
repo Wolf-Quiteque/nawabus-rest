@@ -627,7 +627,8 @@ app.post('/api/payment', async (req, res) => {
 // POST /api/users/get-or-create - Get or create a user profile
 app.post('/api/users/get-or-create', async (req, res) => {
   try {
-    const { name, phone } = req.body;
+    let { name, phone } = req.body;
+    phone = String(phone).trim(); // Ensure phone is string and trim whitespace
 
     if (!name || !phone) {
       return res.status(400).json({ success: false, error: 'Name and phone are required' });
@@ -636,7 +637,7 @@ app.post('/api/users/get-or-create', async (req, res) => {
     // 1. Search for existing profile by phone number
     const { data: existingProfile, error: profileError } = await supabase
       .from('profiles')
-      .select('id')
+      .select('id, phone_number')
       .eq('phone_number', phone)
       .single();
 
@@ -646,8 +647,11 @@ app.post('/api/users/get-or-create', async (req, res) => {
     }
 
     if (existingProfile) {
+      console.log('Found existing profile for phone:', phone, 'userId:', existingProfile.id);
       return res.json({ success: true, userId: existingProfile.id });
     }
+
+    console.log('No existing profile found for phone:', phone, 'creating new user');
 
     // 2. If not found, create a new user and profile
     const email = `${phone}@nawabus.com`;
@@ -669,24 +673,32 @@ app.post('/api/users/get-or-create', async (req, res) => {
     });
 
     if (authError) {
-      // If user already exists, try to find their profile again
-      if (authError.message.includes('already registered')) {
-        const { data: user, error: userError } = await supabase
-          .from('users')
-          .select('id')
-          .eq('email', email)
-          .single();
-
-        if (user) {
-          return res.json({ success: true, userId: user.id });
-        }
+      console.error('SignUp error for phone:', phone, 'email:', email, 'error:', authError.message);
+      // If user already exists with this email/phone
+      if (authError.message.includes('already registered') || authError.message.includes('already exists')) {
+        return res.status(400).json({ success: false, error: 'User with this phone number already exists but is not properly linked. Please contact support.' });
       }
-      console.error('Error creating user:', authError);
-      return res.status(500).json({ success: false, error: authError.message });
+      return res.status(500).json({ success: false, error: 'Failed to create user account: ' + authError.message });
     }
 
-    // The trigger should create the profile, but we return the ID directly
-    res.status(201).json({ success: true, userId: authData.user.id });
+    if (authData && authData.user) {
+      // Ensure the profile has the phone number set
+      const { error: updateError } = await supabase
+        .from('profiles')
+        .update({ phone_number: phone })
+        .eq('id', authData.user.id);
+
+      if (updateError) {
+        console.error('Error updating profile with phone:', updateError);
+        // Continue anyway since user was created
+      }
+
+      console.log('Created new user for phone:', phone, 'userId:', authData.user.id);
+      res.status(201).json({ success: true, userId: authData.user.id });
+    } else {
+      console.error('SignUp succeeded but no user data returned');
+      res.status(500).json({ success: false, error: 'User creation failed unexpectedly' });
+    }
 
   } catch (error) {
     console.error('Get or create user error:', error);
