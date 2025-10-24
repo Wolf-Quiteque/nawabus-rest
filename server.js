@@ -537,7 +537,7 @@ app.post('/api/booking', async (req, res) => {
           seat_class: finalSeatClass,
           seat_number: seatNumber,
           price_paid_usd: trip.price_usd,
-          payment_status: 'paid',
+          payment_status: paymentStatus,
           payment_method: paymentMethod,
           payment_reference: paymentReference,
           qr_code_data: `TKT-${tripId}-${seatNumber}` // Simple QR data
@@ -548,22 +548,26 @@ app.post('/api/booking', async (req, res) => {
       if (ticketError) throw ticketError;
       ticketId = ticket.id;
 
-      // Step 4: Create payment transaction record
-      const { data: paymentTransaction, error: paymentError } = await client
-        .from('payment_transactions')
-        .insert({
-          ticket_id: ticketId,
-          amount_usd: trip.price_usd,
-          currency: 'USD',
-          payment_method: paymentMethod,
-          status: 'completed',
-          transaction_id: paymentReference || `txn-${Date.now()}`
-        })
-        .select('id')
-        .single();
+      // Step 4: Create payment transaction record only for completed payments (cash)
+      let paymentTransaction = null;
+      if (paymentMethod === 'cash') {
+        const { data: paymentTx, error: paymentError } = await client
+          .from('payment_transactions')
+          .insert({
+            ticket_id: ticketId,
+            amount_usd: trip.price_usd,
+            currency: 'USD',
+            payment_method: paymentMethod,
+            status: 'completed',
+            transaction_id: paymentReference || `txn-${Date.now()}`
+          })
+          .select('id')
+          .single();
 
-      if (paymentError) throw paymentError;
-      paymentTransactionId = paymentTransaction.id;
+        if (paymentError) throw paymentError;
+        paymentTransaction = paymentTx;
+        paymentTransactionId = paymentTx.id;
+      }
 
       // Step 5: Update available seats (this should be handled by trigger, but let's ensure it)
       await client.rpc('update_available_seats', {});
@@ -621,6 +625,81 @@ app.post('/api/payment', async (req, res) => {
   } catch (error) {
     console.error('Payment error:', error);
     res.status(500).json({ error: 'Payment processing failed' });
+  }
+});
+
+// PATCH /api/tickets/:ticketId/update-status - Update ticket payment status
+app.patch('/api/tickets/:ticketId/update-status', async (req, res) => {
+  try {
+    const { ticketId } = req.params;
+    const { payment_status } = req.body;
+
+    if (!payment_status || !['paid', 'pending', 'failed', 'refunded'].includes(payment_status)) {
+      return res.status(400).json({ error: 'Invalid payment status' });
+    }
+
+    const { data: ticket, error } = await supabase
+      .from('tickets')
+      .update({ payment_status })
+      .eq('id', ticketId)
+      .select('id, payment_status, ticket_number')
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Ticket not found' });
+      }
+      console.error('Supabase error:', error);
+      return res.status(500).json({
+        error: 'Database error',
+        details: error.message
+      });
+    }
+
+    // If marking as paid, also create payment transaction if it doesn't exist
+    if (payment_status === 'paid') {
+      const { data: ticketWithTrip } = await supabase
+        .from('tickets')
+        .select('price_paid_usd, trip_id')
+        .eq('id', ticketId)
+        .single();
+
+      // Check if payment transaction already exists
+      const { data: existingTx } = await supabase
+        .from('payment_transactions')
+        .select('id')
+        .eq('ticket_id', ticketId)
+        .single();
+
+      if (!existingTx) {
+        await supabase
+          .from('payment_transactions')
+          .insert({
+            ticket_id: ticketId,
+            amount_usd: ticketWithTrip.price_paid_usd,
+            currency: 'USD',
+            payment_method: 'cash', // Assuming cash for this update
+            status: 'completed',
+            transaction_id: `cash-${Date.now()}`
+          });
+
+        // Update trip available seats
+        await supabase.rpc('update_available_seats', {});
+      }
+    }
+
+    res.json({
+      success: true,
+      ticket: {
+        id: ticket.id,
+        payment_status: ticket.payment_status,
+        ticket_number: ticket.ticket_number
+      }
+    });
+
+  } catch (error) {
+    console.error('Update ticket status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
