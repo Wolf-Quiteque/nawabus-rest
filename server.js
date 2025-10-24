@@ -485,12 +485,17 @@ app.post('/api/booking', async (req, res) => {
       seatNumber,
       seatClass,
       paymentMethod,
-      paymentReference
+      paymentReference,
+      paymentStatus = 'pending' // Default to pending if not provided
     } = req.body;
 
     if (!tripId || !passengerId || !seatNumber || !paymentMethod) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
+
+    // Ensure paymentStatus is valid
+    const validStatuses = ['pending', 'paid', 'failed', 'refunded'];
+    const finalPaymentStatus = validStatuses.includes(paymentStatus) ? paymentStatus : 'pending';
 
     // Start transaction-like operation
     let ticketId = null;
@@ -537,7 +542,7 @@ app.post('/api/booking', async (req, res) => {
           seat_class: finalSeatClass,
           seat_number: seatNumber,
           price_paid_usd: trip.price_usd,
-          payment_status: paymentStatus,
+          payment_status: finalPaymentStatus,
           payment_method: paymentMethod,
           payment_reference: paymentReference,
           qr_code_data: `TKT-${tripId}-${seatNumber}` // Simple QR data
@@ -550,7 +555,7 @@ app.post('/api/booking', async (req, res) => {
 
       // Step 4: Create payment transaction record only for completed payments (cash)
       let paymentTransaction = null;
-      if (paymentMethod === 'cash') {
+      if (paymentMethod === 'cash' && finalPaymentStatus === 'paid') {
         const { data: paymentTx, error: paymentError } = await client
           .from('payment_transactions')
           .insert({
