@@ -244,6 +244,7 @@ app.get('/api/trips', async (req, res) => {
       offset = '0'
     } = req.query;
 
+    console.log('Request URL:', req.url);
     console.log('Search params:', { origin, destination, date, seatClass, sort, order, limit, offset });
 
     let query = supabase
@@ -280,10 +281,10 @@ app.get('/api/trips', async (req, res) => {
 
     // Apply filters
     if (origin && origin.trim()) {
-      query = query.ilike('routes.origin_city', `%${origin.trim()}%`);
+      query = query.ilike('routes.origin_province', `%${origin.trim()}%`);
     }
     if (destination && destination.trim()) {
-      query = query.ilike('routes.destination_city', `%${destination.trim()}%`);
+      query = query.ilike('routes.destination_province', `%${destination.trim()}%`);
     }
     if (date && date.trim()) {
       // Create date range for the specified date
@@ -466,6 +467,54 @@ app.get('/api/routes', async (req, res) => {
     }
 
     res.json({ routes: routes || [] });
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+// GET /api/provinces - Get distinct origin and destination provinces from routes
+app.get('/api/provinces', async (req, res) => {
+  try {
+    // Get distinct origin provinces
+    const { data: originProvinces, error: originError } = await supabase
+      .from('routes')
+      .select('origin_province')
+      .eq('is_active', true);
+
+    if (originError) {
+      console.error('Origin provinces error:', originError);
+      return res.status(500).json({
+        error: 'Database error',
+        details: originError.message
+      });
+    }
+
+    // Get distinct destination provinces
+    const { data: destinationProvinces, error: destinationError } = await supabase
+      .from('routes')
+      .select('destination_province')
+      .eq('is_active', true);
+
+    if (destinationError) {
+      console.error('Destination provinces error:', destinationError);
+      return res.status(500).json({
+        error: 'Database error',
+        details: destinationError.message
+      });
+    }
+
+    // Extract unique provinces
+    const origins = [...new Set(originProvinces.map(r => r.origin_province))].sort();
+    const destinations = [...new Set(destinationProvinces.map(r => r.destination_province))].sort();
+
+    res.json({
+      origins: origins,
+      destinations: destinations
+    });
   } catch (error) {
     console.error('Server error:', error);
     res.status(500).json({
