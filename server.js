@@ -476,54 +476,6 @@ app.get('/api/routes', async (req, res) => {
   }
 });
 
-// GET /api/provinces - Get distinct origin and destination provinces from routes
-app.get('/api/provinces', async (req, res) => {
-  try {
-    // Get distinct origin provinces
-    const { data: originProvinces, error: originError } = await supabase
-      .from('routes')
-      .select('origin_province')
-      .eq('is_active', true);
-
-    if (originError) {
-      console.error('Origin provinces error:', originError);
-      return res.status(500).json({
-        error: 'Database error',
-        details: originError.message
-      });
-    }
-
-    // Get distinct destination provinces
-    const { data: destinationProvinces, error: destinationError } = await supabase
-      .from('routes')
-      .select('destination_province')
-      .eq('is_active', true);
-
-    if (destinationError) {
-      console.error('Destination provinces error:', destinationError);
-      return res.status(500).json({
-        error: 'Database error',
-        details: destinationError.message
-      });
-    }
-
-    // Extract unique provinces
-    const origins = [...new Set(originProvinces.map(r => r.origin_province))].sort();
-    const destinations = [...new Set(destinationProvinces.map(r => r.destination_province))].sort();
-
-    res.json({
-      origins: origins,
-      destinations: destinations
-    });
-  } catch (error) {
-    console.error('Server error:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      details: error.message
-    });
-  }
-});
-
 // POST /api/booking - Book a trip
 app.post('/api/booking', async (req, res) => {
   const client = supabase;
