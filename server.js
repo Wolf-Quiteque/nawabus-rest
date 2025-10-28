@@ -479,7 +479,7 @@ app.get('/api/routes', async (req, res) => {
 // POST /api/booking - Book a trip
 app.post('/api/booking', async (req, res) => {
   const client = supabase;
-  try {
+  
     // Verify authentication
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -633,10 +633,7 @@ app.post('/api/booking', async (req, res) => {
       throw dbError;
     }
 
-  } catch (error) {
-    console.error('Booking error:', error);
-    res.status(500).json({ error: 'Booking failed', details: error.message });
-  }
+  
 });
 
 // POST /api/payment - Handle payment (placeholder for future payment integration)kkk
