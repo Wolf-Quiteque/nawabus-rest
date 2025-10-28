@@ -480,6 +480,43 @@ app.get('/api/routes', async (req, res) => {
 app.post('/api/booking', async (req, res) => {
   const client = supabase;
   try {
+    // Verify authentication
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        success: false,
+        error: 'No access token provided'
+      });
+    }
+
+    const accessToken = authHeader.substring(7); // Remove 'Bearer ' prefix
+
+    // Verify the session with Supabase
+    const { data: { user }, error: verifyError } = await supabase.auth.getUser(accessToken);
+
+    if (verifyError || !user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid or expired token'
+      });
+    }
+
+    // Check agent role
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', user.id)
+      .single();
+
+    if (profileError || !profile || (!['agent', 'admin'].includes(profile.role))) {
+      return res.status(403).json({
+        success: false,
+        error: 'Unauthorized: Only agents can book tickets through this endpoint'
+      });
+    }
+
+    const bookedBy = user.id; // Agent who is booking the ticket
+
     const {
       tripId,
       passengerId,
@@ -539,6 +576,7 @@ app.post('/api/booking', async (req, res) => {
         .insert({
           trip_id: tripId,
           passenger_id: passengerId,
+          booked_by: bookedBy, // Agent who sold the ticket
           booking_source: 'mobile_app', // Since this is for the separate app
           seat_class: finalSeatClass,
           seat_number: seatNumber,
