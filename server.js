@@ -476,10 +476,17 @@ app.get('/api/routes', async (req, res) => {
   }
 });
 
+// Helper function to generate reference number
+function generateReferenceCode() {
+  const ts = Date.now().toString();
+  const tail = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
+  return ts.slice(-8) + tail;
+}
+
 // POST /api/booking - Book a trip
 app.post('/api/booking', async (req, res) => {
   const client = supabase;
-  
+  try {
     // Verify authentication
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -538,6 +545,7 @@ app.post('/api/booking', async (req, res) => {
     // Start transaction-like operation
     let ticketId = null;
     let paymentTransactionId = null;
+    let generatedReference = null;
 
     try {
       // Step 1: Check if seat is available
@@ -570,7 +578,24 @@ app.post('/api/booking', async (req, res) => {
       // Use seat_class from trip if not provided
       const finalSeatClass = seatClass || trip.seat_class;
 
-      // Step 3: Create the ticket
+      // Generate reference if needed (for non-cash payments with empty/null reference)
+      let initialReference = null;
+      if (paymentMethod !== 'cash') {
+        if (!paymentReference || paymentReference.trim() === '') {
+          // Will generate and update after insert to trigger SMS
+          initialReference = null;
+          generatedReference = generateReferenceCode();
+        } else {
+          initialReference = paymentReference;
+          generatedReference = paymentReference;
+        }
+      } else {
+        // For cash payments, use provided reference or generate one
+        initialReference = paymentReference || `agent-${Date.now()}`;
+        generatedReference = initialReference;
+      }
+
+      // Step 3: Create the ticket (with NULL reference if we need to trigger SMS)
       const { data: ticket, error: ticketError } = await client
         .from('tickets')
         .insert({
@@ -583,7 +608,7 @@ app.post('/api/booking', async (req, res) => {
           price_paid_usd: trip.price_usd,
           payment_status: finalPaymentStatus,
           payment_method: paymentMethod,
-          payment_reference: paymentReference,
+          payment_reference: initialReference, // NULL for non-cash without reference
           qr_code_data: `TKT-${tripId}-${seatNumber}` // Simple QR data
         })
         .select('id, ticket_number')
@@ -591,6 +616,19 @@ app.post('/api/booking', async (req, res) => {
 
       if (ticketError) throw ticketError;
       ticketId = ticket.id;
+
+      // Step 3b: If we generated a reference, update the ticket to trigger SMS
+      if (initialReference === null && generatedReference) {
+        const { error: updateError } = await client
+          .from('tickets')
+          .update({ payment_reference: generatedReference })
+          .eq('id', ticketId);
+
+        if (updateError) {
+          console.error('Failed to update payment reference:', updateError);
+          // Don't throw - ticket is created, just log the error
+        }
+      }
 
       // Step 4: Create payment transaction record only for completed payments (cash)
       let paymentTransaction = null;
@@ -624,7 +662,8 @@ app.post('/api/booking', async (req, res) => {
           seat_number: seatNumber,
           price_paid_usd: trip.price_usd,
           qr_code_data: `TKT-${tripId}-${seatNumber}`,
-          ticket_number: ticket.ticket_number
+          ticket_number: ticket.ticket_number,
+          payment_reference: generatedReference // Return the reference number
         }
       });
 
@@ -633,7 +672,10 @@ app.post('/api/booking', async (req, res) => {
       throw dbError;
     }
 
-  
+  } catch (error) {
+    console.error('Booking error:', error);
+    res.status(500).json({ error: 'Booking failed', details: error.message });
+  }
 });
 
 // POST /api/payment - Handle payment (placeholder for future payment integration)kkk
