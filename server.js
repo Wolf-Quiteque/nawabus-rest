@@ -580,19 +580,24 @@ app.post('/api/booking', async (req, res) => {
 
       // Generate reference if needed (for non-cash payments with empty/null reference)
       let initialReference = null;
+      let shouldUpdateReference = false;
+
       if (paymentMethod !== 'cash') {
         if (!paymentReference || paymentReference.trim() === '') {
           // Will generate and update after insert to trigger SMS
           initialReference = null;
           generatedReference = generateReferenceCode();
+          shouldUpdateReference = true;
         } else {
           initialReference = paymentReference;
           generatedReference = paymentReference;
+          shouldUpdateReference = true;
         }
       } else {
-        // For cash payments, use provided reference or generate one
+        // For cash payments, set reference immediately (no SMS trigger needed)
         initialReference = paymentReference || `agent-${Date.now()}`;
         generatedReference = initialReference;
+        shouldUpdateReference = false; // Don't trigger SMS for cash
       }
 
       // Step 3: Create the ticket (with NULL reference if we need to trigger SMS)
@@ -617,8 +622,8 @@ app.post('/api/booking', async (req, res) => {
       if (ticketError) throw ticketError;
       ticketId = ticket.id;
 
-      // Step 3b: If we generated a reference, update the ticket to trigger SMS
-      if (initialReference === null && generatedReference) {
+      // Step 3b: If we need to update reference to trigger SMS (non-cash only)
+      if (shouldUpdateReference && initialReference === null && generatedReference) {
         const { error: updateError } = await client
           .from('tickets')
           .update({ payment_reference: generatedReference })
