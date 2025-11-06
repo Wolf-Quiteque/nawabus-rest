@@ -873,6 +873,130 @@ app.post('/api/users/get-or-create', async (req, res) => {
   }
 });
 
+// POST /api/mobile/booking - Create booking for mobile app with payment reference
+app.post('/api/mobile/booking', async (req, res) => {
+  try {
+    const {
+      outboundTrip,
+      returnTrip,
+      outboundSeats,
+      returnSeats,
+      passengerId,
+      passengerName,
+      passengerEmail,
+      paymentMethod
+    } = req.body;
+
+    // Validation
+    if (!outboundTrip || !outboundSeats || outboundSeats.length === 0 || !passengerId) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const ticketIds = [];
+    let totalAmount = 0;
+
+    // Create outbound tickets
+    for (const seatNumber of outboundSeats) {
+      const { data: ticket, error } = await supabase
+        .from('tickets')
+        .insert({
+          trip_id: outboundTrip.id,
+          passenger_id: passengerId,
+          booked_by: passengerId,
+          booking_source: 'mobile_app',
+          seat_class: outboundTrip.seat_class || 'economy',
+          seat_number: seatNumber,
+          price_paid_usd: outboundTrip.price_usd,
+          payment_status: 'pending',
+          payment_method: paymentMethod || 'referencia',
+          qr_code_data: `TKT-${outboundTrip.id}-${seatNumber}`
+        })
+        .select('id, ticket_number, price_paid_usd')
+        .single();
+
+      if (error) throw error;
+      ticketIds.push(ticket.id);
+      totalAmount += ticket.price_paid_usd;
+    }
+
+    // Create return tickets if round trip
+    if (returnTrip && returnSeats && returnSeats.length > 0) {
+      for (const seatNumber of returnSeats) {
+        const { data: ticket, error } = await supabase
+          .from('tickets')
+          .insert({
+            trip_id: returnTrip.id,
+            passenger_id: passengerId,
+            booked_by: passengerId,
+            booking_source: 'mobile_app',
+            seat_class: returnTrip.seat_class || 'economy',
+            seat_number: seatNumber,
+            price_paid_usd: returnTrip.price_usd,
+            payment_status: 'pending',
+            payment_method: paymentMethod || 'referencia',
+            qr_code_data: `TKT-${returnTrip.id}-${seatNumber}`
+          })
+          .select('id, ticket_number, price_paid_usd')
+          .single();
+
+        if (error) throw error;
+        ticketIds.push(ticket.id);
+        totalAmount += ticket.price_paid_usd;
+      }
+    }
+
+    // Generate payment reference for MULTICAIXA
+    let paymentReference = null;
+    if (paymentMethod === 'referencia') {
+      try {
+        const paymentApiUrl = process.env.PAYMENT_API_URL || 'https://payments-nawabus.vercel.app/api/create-payment';
+
+        const paymentResponse = await fetch(paymentApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            ticket_id: ticketIds[0], // Primary ticket
+            amount: totalAmount,
+            passenger_name: passengerName,
+            passenger_email: passengerEmail,
+          }),
+        });
+
+        if (paymentResponse.ok) {
+          const paymentData = await paymentResponse.json();
+          paymentReference = paymentData.reference_number || paymentData.reference;
+
+          // Update all tickets with the payment reference
+          for (const ticketId of ticketIds) {
+            await supabase
+              .from('tickets')
+              .update({ payment_reference: paymentReference })
+              .eq('id', ticketId);
+          }
+        }
+      } catch (paymentError) {
+        console.error('Payment reference generation failed:', paymentError);
+        // Continue without reference - tickets are already created
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      ticketIds,
+      totalAmount,
+      paymentReference,
+      entity: '1219', // MULTICAIXA entity
+      message: 'Booking created successfully'
+    });
+
+  } catch (error) {
+    console.error('Mobile booking error:', error);
+    res.status(500).json({ error: 'Booking failed', details: error.message });
+  }
+});
+
 // GET /api/health - Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
