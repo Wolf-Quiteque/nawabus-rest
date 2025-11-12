@@ -531,7 +531,8 @@ app.post('/api/booking', async (req, res) => {
       seatClass,
       paymentMethod,
       paymentReference,
-      paymentStatus = 'pending' // Default to pending if not provided
+      paymentStatus = 'pending', // Default to pending if not provided
+      ticketNumber = null // Allow client to provide pre-generated ticket number
     } = req.body;
 
     if (!tripId || !passengerId || !seatNumber || !paymentMethod) {
@@ -601,21 +602,28 @@ app.post('/api/booking', async (req, res) => {
       }
 
       // Step 3: Create the ticket (with NULL reference if we need to trigger SMS)
+      const ticketInsertData = {
+        trip_id: tripId,
+        passenger_id: passengerId,
+        booked_by: bookedBy, // Agent who sold the ticket
+        booking_source: 'mobile_app', // Since this is for the separate app
+        seat_class: finalSeatClass,
+        seat_number: seatNumber,
+        price_paid_usd: trip.price_usd,
+        payment_status: finalPaymentStatus,
+        payment_method: paymentMethod,
+        payment_reference: initialReference, // NULL for non-cash without reference
+        qr_code_data: `TKT-${tripId}-${seatNumber}` // Simple QR data
+      };
+
+      // Add ticket_number if provided by client (hybrid approach)
+      if (ticketNumber) {
+        ticketInsertData.ticket_number = ticketNumber;
+      }
+
       const { data: ticket, error: ticketError } = await client
         .from('tickets')
-        .insert({
-          trip_id: tripId,
-          passenger_id: passengerId,
-          booked_by: bookedBy, // Agent who sold the ticket
-          booking_source: 'mobile_app', // Since this is for the separate app
-          seat_class: finalSeatClass,
-          seat_number: seatNumber,
-          price_paid_usd: trip.price_usd,
-          payment_status: finalPaymentStatus,
-          payment_method: paymentMethod,
-          payment_reference: initialReference, // NULL for non-cash without reference
-          qr_code_data: `TKT-${tripId}-${seatNumber}` // Simple QR data
-        })
+        .insert(ticketInsertData)
         .select('id, ticket_number')
         .single();
 
@@ -680,6 +688,109 @@ app.post('/api/booking', async (req, res) => {
   } catch (error) {
     console.error('Booking error:', error);
     res.status(500).json({ error: 'Booking failed', details: error.message });
+  }
+});
+
+// PATCH /api/tickets/:ticketId/mark-paid - Mark ticket as paid after successful print (Hybrid approach)
+app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
+  const client = supabase;
+  try {
+    // Verify authentication
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        success: false,
+        error: 'No access token provided'
+      });
+    }
+
+    const accessToken = authHeader.substring(7);
+    const { data: { user }, error: verifyError } = await supabase.auth.getUser(accessToken);
+
+    if (verifyError || !user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid or expired token'
+      });
+    }
+
+    // Check agent role
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', user.id)
+      .single();
+
+    if (profileError || !profile || (!['agent', 'admin'].includes(profile.role))) {
+      return res.status(403).json({
+        success: false,
+        error: 'Unauthorized: Only agents can update ticket status'
+      });
+    }
+
+    const { ticketId } = req.params;
+    const { paymentMethod } = req.body;
+
+    if (!ticketId) {
+      return res.status(400).json({ error: 'Missing ticketId' });
+    }
+
+    // Fetch the ticket to get price and trip_id
+    const { data: ticket, error: ticketError } = await client
+      .from('tickets')
+      .select('id, price_paid_usd, trip_id, payment_status')
+      .eq('id', ticketId)
+      .single();
+
+    if (ticketError || !ticket) {
+      return res.status(404).json({ error: 'Ticket not found' });
+    }
+
+    // Only update if currently pending
+    if (ticket.payment_status !== 'pending') {
+      return res.status(400).json({
+        error: `Ticket already has status: ${ticket.payment_status}`,
+        current_status: ticket.payment_status
+      });
+    }
+
+    // Update ticket to paid status
+    const { error: updateError } = await client
+      .from('tickets')
+      .update({ payment_status: 'paid' })
+      .eq('id', ticketId);
+
+    if (updateError) throw updateError;
+
+    // Create payment transaction record
+    const { error: paymentError } = await client
+      .from('payment_transactions')
+      .insert({
+        ticket_id: ticketId,
+        amount_usd: ticket.price_paid_usd,
+        currency: 'USD',
+        payment_method: paymentMethod || 'cash',
+        status: 'completed',
+        transaction_id: `agent-${Date.now()}`
+      });
+
+    if (paymentError) {
+      console.error('Failed to create payment transaction:', paymentError);
+      // Don't throw - ticket status is already updated
+    }
+
+    // Trigger seat update (though trigger should handle this automatically)
+    await client.rpc('update_available_seats', {});
+
+    res.json({
+      success: true,
+      message: 'Ticket marked as paid',
+      ticket_id: ticketId
+    });
+
+  } catch (error) {
+    console.error('Mark paid error:', error);
+    res.status(500).json({ error: 'Failed to mark ticket as paid', details: error.message });
   }
 });
 
