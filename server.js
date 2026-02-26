@@ -86,6 +86,45 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// POST /api/auth/refresh - Refresh access token using refresh_token
+app.post('/api/auth/refresh', async (req, res) => {
+  try {
+    const { refresh_token } = req.body;
+
+    if (!refresh_token) {
+      return res.status(400).json({
+        success: false,
+        error: 'refresh_token is required'
+      });
+    }
+
+    const { data, error } = await supabase.auth.refreshSession({ refresh_token });
+
+    if (error) {
+      console.error('Token refresh error:', error);
+      return res.status(401).json({
+        success: false,
+        error: 'Failed to refresh token: ' + error.message
+      });
+    }
+
+    res.json({
+      success: true,
+      session: {
+        access_token: data.session?.access_token,
+        refresh_token: data.session?.refresh_token,
+        expires_at: data.session?.expires_at
+      }
+    });
+  } catch (error) {
+    console.error('Refresh error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error during token refresh'
+    });
+  }
+});
+
 // POST /api/auth/register - User registration
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -272,7 +311,8 @@ app.get('/api/trips', async (req, res) => {
           capacity,
           amenities,
           companies!inner (
-            name
+            name,
+            logo_url
           )
         )
       `)
@@ -824,6 +864,31 @@ app.post('/api/payment', async (req, res) => {
   } catch (error) {
     console.error('Payment error:', error);
     res.status(500).json({ error: 'Payment processing failed' });
+  }
+});
+
+// GET /api/tickets/by-reference/:ref - Look up a ticket by payment_reference
+app.get('/api/tickets/by-reference/:ref', async (req, res) => {
+  try {
+    const { ref } = req.params;
+
+    const { data: ticket, error } = await supabase
+      .from('tickets')
+      .select('id, payment_status, trip_id, seat_number')
+      .eq('payment_reference', ref)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.json({ success: false, error: 'Not found' });
+      }
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    res.json({ success: true, ticket });
+  } catch (error) {
+    console.error('Ticket by reference error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
