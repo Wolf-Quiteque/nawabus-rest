@@ -22,7 +22,7 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 // Routes
 
 // Routes
-
+'0«'
 // POST /api/auth/login - User login
 app.post('/api/auth/login', async (req, res) => {
   try {
@@ -451,15 +451,18 @@ app.get('/api/trips/:tripId', async (req, res) => {
   }
 });
 
-// GET /api/trips/:tripId/booked_seats - Get booked seats for a trip
+// GET /api/trips/:tripId/booked_seats - Get booked seats for a trip (including sibling trips)
 app.get('/api/trips/:tripId/booked_seats', async (req, res) => {
   try {
     const { tripId } = req.params;
 
+    // Resolve all sibling trip IDs (same bus + departure minute)
+    const siblingIds = await getSiblingTripIds(tripId);
+
     const { data: seats, error } = await supabase
       .from('tickets')
       .select('seat_number')
-      .eq('trip_id', tripId)
+      .in('trip_id', siblingIds)
       .in('status', ['active', 'used', 'pending']); // Include pending and used tickets as booked
 
     if (error) {
@@ -515,6 +518,31 @@ app.get('/api/routes', async (req, res) => {
     });
   }
 });
+
+// Helper: get all trip IDs that share the same bus + departure minute (sibling trips)
+async function getSiblingTripIds(tripId) {
+  const { data: trip } = await supabase
+    .from('trips')
+    .select('bus_id, departure_time')
+    .eq('id', tripId)
+    .single();
+
+  if (!trip) return [tripId];
+
+  const d = new Date(trip.departure_time);
+  d.setSeconds(0, 0);
+  const start = d.toISOString();
+  const end = new Date(d.getTime() + 60000).toISOString();
+
+  const { data: siblings } = await supabase
+    .from('trips')
+    .select('id')
+    .eq('bus_id', trip.bus_id)
+    .gte('departure_time', start)
+    .lt('departure_time', end);
+
+  return siblings?.map(s => s.id) ?? [tripId];
+}
 
 // Helper function to generate reference number
 function generateReferenceCode() {
@@ -589,11 +617,12 @@ app.post('/api/booking', async (req, res) => {
     let generatedReference = null;
 
     try {
-      // Step 1: Check if seat is available
+      // Step 1: Check if seat is available across all sibling trips (same bus + departure minute)
+      const siblingIds = await getSiblingTripIds(tripId);
       const { data: existingTicket, error: ticketCheckError } = await client
         .from('tickets')
         .select('id')
-        .eq('trip_id', tripId)
+        .in('trip_id', siblingIds)
         .eq('seat_number', seatNumber)
         .in('status', ['active', 'pending']);
 
@@ -1049,6 +1078,36 @@ app.post('/api/users/get-or-create', async (req, res) => {
   }
 });
 
+// GET /api/validate-coupon?code=XXXX - Validate a coupon code
+app.get('/api/validate-coupon', async (req, res) => {
+  try {
+    const code = (req.query.code || '').trim().toUpperCase();
+
+    if (!code) {
+      return res.status(400).json({ valid: false, message: 'Código é obrigatório' });
+    }
+
+    const { data, error } = await supabase
+      .from('coupons')
+      .select('id, code, discount_percentage, is_active')
+      .eq('code', code)
+      .single();
+
+    if (error || !data) {
+      return res.json({ valid: false, message: 'Cupom inválido ou inexistente' });
+    }
+
+    if (!data.is_active) {
+      return res.json({ valid: false, message: 'Este cupom está inactivo' });
+    }
+
+    return res.json({ valid: true, discount_percentage: data.discount_percentage, code: data.code });
+  } catch (error) {
+    console.error('Error validating coupon:', error);
+    res.status(500).json({ valid: false, message: 'Erro ao validar cupom' });
+  }
+});
+
 // POST /api/mobile/booking - Create booking for mobile app with payment reference
 app.post('/api/mobile/booking', async (req, res) => {
   try {
@@ -1060,12 +1119,27 @@ app.post('/api/mobile/booking', async (req, res) => {
       passengerId,
       passengerName,
       passengerEmail,
-      paymentMethod
+      paymentMethod,
+      couponCode
     } = req.body;
 
     // Validation
     if (!outboundTrip || !outboundSeats || outboundSeats.length === 0 || !passengerId) {
       return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Validate coupon if provided
+    let discountFactor = 1;
+    if (couponCode) {
+      const normalizedCode = couponCode.trim().toUpperCase();
+      const { data: coupon } = await supabase
+        .from('coupons')
+        .select('discount_percentage, is_active')
+        .eq('code', normalizedCode)
+        .single();
+      if (coupon && coupon.is_active) {
+        discountFactor = 1 - coupon.discount_percentage / 100;
+      }
     }
 
     const ticketIds = [];
@@ -1082,7 +1156,7 @@ app.post('/api/mobile/booking', async (req, res) => {
           booking_source: 'mobile_app',
           seat_class: outboundTrip.seat_class || 'economy',
           seat_number: seatNumber,
-          price_paid_usd: outboundTrip.price_usd,
+          price_paid_usd: parseFloat((outboundTrip.price_usd * discountFactor).toFixed(2)),
           payment_status: 'pending',
           payment_method: paymentMethod || 'referencia',
           qr_code_data: `TKT-${outboundTrip.id}-${seatNumber}`
@@ -1107,7 +1181,7 @@ app.post('/api/mobile/booking', async (req, res) => {
             booking_source: 'mobile_app',
             seat_class: returnTrip.seat_class || 'economy',
             seat_number: seatNumber,
-            price_paid_usd: returnTrip.price_usd,
+            price_paid_usd: parseFloat((returnTrip.price_usd * discountFactor).toFixed(2)),
             payment_status: 'pending',
             payment_method: paymentMethod || 'referencia',
             qr_code_data: `TKT-${returnTrip.id}-${seatNumber}`
