@@ -145,6 +145,7 @@ npm install
 ```
 SUPABASE_URL=your-supabase-url
 SUPABASE_ANON_KEY=your-anon-key
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 PORT=5000
 ```
 

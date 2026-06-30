@@ -16,8 +16,64 @@ app.use(express.urlencoded({ extended: true }));
 // Supabase client
 const supabaseUrl = process.env.SUPABASE_URL || 'https://placeholder.supabase.co';
 const supabaseKey = process.env.SUPABASE_ANON_KEY || 'placeholder-key';
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: {
+    autoRefreshToken: false,
+    persistSession: false
+  }
+});
+const supabaseAdmin = supabaseServiceRoleKey
+  ? createClient(supabaseUrl, supabaseServiceRoleKey, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false
+      }
+    })
+  : supabase;
+
+function normalizePhoneNumber(phone) {
+  const cleaned = String(phone || '').replace(/\D/g, '');
+  if (!cleaned) return '';
+  if (cleaned.length === 9 && cleaned.startsWith('9')) {
+    return `244${cleaned}`;
+  }
+  return cleaned;
+}
+
+function phoneSearchVariants(phone) {
+  const normalized = normalizePhoneNumber(phone);
+  const cleaned = String(phone || '').replace(/\D/g, '');
+  const variants = new Set([
+    String(phone || '').trim(),
+    cleaned,
+    normalized
+  ].filter(Boolean));
+
+  if (normalized.startsWith('244') && normalized.length === 12) {
+    variants.add(normalized.slice(3));
+  }
+
+  return [...variants];
+}
+
+function splitFullName(name) {
+  const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+  return {
+    firstName: parts[0] || '',
+    lastName: parts.slice(1).join(' ')
+  };
+}
+
+function createRequestAuthClient() {
+  return createClient(supabaseUrl, supabaseKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false
+    }
+  });
+}
 
 // Routes
 
@@ -1000,72 +1056,150 @@ app.patch('/api/tickets/:ticketId/update-status', async (req, res) => {
 app.post('/api/users/get-or-create', async (req, res) => {
   try {
     let { name, phone } = req.body;
-    phone = String(phone).trim(); // Ensure phone is string and trim whitespace
+    name = String(name || '').trim();
+    const normalizedPhone = normalizePhoneNumber(phone);
+    const phoneVariants = phoneSearchVariants(phone);
 
-    if (!name || !phone) {
+    if (!name || !normalizedPhone) {
       return res.status(400).json({ success: false, error: 'Name and phone are required' });
     }
 
-    // 1. Search for existing profile by phone number
-    const { data: existingProfile, error: profileError } = await supabase
-      .from('profiles')
-      .select('id, phone_number')
-      .eq('phone_number', phone)
-      .single();
+    if (normalizedPhone.length < 9) {
+      return res.status(400).json({ success: false, error: 'Invalid phone number' });
+    }
 
-    if (profileError && profileError.code !== 'PGRST116') { // PGRST116 = no rows found
+    // 1. Search for an existing passenger by normalized phone and common legacy variants.
+    const { data: existingProfiles, error: profileError } = await supabase
+      .from('profiles')
+      .select('id, phone_number, role')
+      .in('phone_number', phoneVariants)
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (profileError) {
       console.error('Error searching for profile:', profileError);
       return res.status(500).json({ success: false, error: 'Database error' });
     }
 
+    const existingProfile = existingProfiles?.[0];
     if (existingProfile) {
-      console.log('Found existing profile for phone:', phone, 'userId:', existingProfile.id);
+      if (existingProfile.phone_number !== normalizedPhone) {
+        const { error: normalizeError } = await supabaseAdmin
+          .from('profiles')
+          .update({ phone_number: normalizedPhone })
+          .eq('id', existingProfile.id);
+
+        if (normalizeError) {
+          console.warn('Could not normalize existing profile phone:', normalizeError);
+        }
+      }
+
+      console.log('Found existing profile for phone:', normalizedPhone, 'userId:', existingProfile.id);
       return res.json({ success: true, userId: existingProfile.id });
     }
 
-    console.log('No existing profile found for phone:', phone, 'creating new user');
+    console.log('No existing profile found for phone:', normalizedPhone, 'creating new user');
 
     // 2. If not found, create a new user and profile
-    const email = `${phone}@nawabus.com`;
+    const email = `${normalizedPhone}@nawabus.com`;
     const password = 'luanda2025';
-    const [firstName, ...lastNameParts] = name.split(' ');
-    const lastName = lastNameParts.join(' ');
+    const { firstName, lastName } = splitFullName(name);
+    const authClient = createRequestAuthClient();
 
-    const { data: authData, error: authError } = await supabase.auth.signUp({
-      email: email,
-      password: password,
-      options: {
-        data: {
+    let authData = null;
+    let authError = null;
+
+    if (supabaseServiceRoleKey) {
+      const result = await supabaseAdmin.auth.admin.createUser({
+        email,
+        password,
+        email_confirm: true,
+        user_metadata: {
           first_name: firstName,
           last_name: lastName,
           role: 'passenger',
-          phone_number: phone
+          phone_number: normalizedPhone
         }
-      }
-    });
+      });
+      authData = result.data;
+      authError = result.error;
+    } else {
+      const result = await authClient.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            first_name: firstName,
+            last_name: lastName,
+            role: 'passenger',
+            phone_number: normalizedPhone
+          }
+        }
+      });
+      authData = result.data;
+      authError = result.error;
+    }
 
     if (authError) {
-      console.error('SignUp error for phone:', phone, 'email:', email, 'error:', authError.message);
-      // If user already exists with this email/phone
-      if (authError.message.includes('already registered') || authError.message.includes('already exists')) {
-        return res.status(400).json({ success: false, error: 'User with this phone number already exists but is not properly linked. Please contact support.' });
+      console.error('User creation error for phone:', normalizedPhone, 'email:', email, 'error:', authError.message);
+
+      if (authError.message.includes('already registered') || authError.message.includes('already exists') || authError.message.includes('already been registered')) {
+        const { data: signInData, error: signInError } = await authClient.auth.signInWithPassword({
+          email,
+          password
+        });
+
+        if (!signInError && signInData?.user?.id) {
+          const profileClient = supabaseServiceRoleKey ? supabaseAdmin : authClient;
+          const { error: upsertError } = await profileClient
+            .from('profiles')
+            .upsert({
+              id: signInData.user.id,
+              role: 'passenger',
+              first_name: firstName,
+              last_name: lastName,
+              phone_number: normalizedPhone
+            }, { onConflict: 'id' });
+
+          if (upsertError) {
+            console.warn('Could not repair profile for existing auth user:', upsertError);
+          }
+
+          return res.json({ success: true, userId: signInData.user.id });
+        }
+
+        const { data: retryProfiles, error: retryProfileError } = await supabase
+          .from('profiles')
+          .select('id, phone_number')
+          .in('phone_number', phoneVariants)
+          .limit(1);
+
+        if (!retryProfileError && retryProfiles?.[0]?.id) {
+          return res.json({ success: true, userId: retryProfiles[0].id });
+        }
       }
-      return res.status(500).json({ success: false, error: 'Failed to create user account: ' + authError.message });
+
+      return res.status(500).json({ success: false, error: 'Failed to get or create passenger account' });
     }
 
     if (authData && authData.user) {
       // Ensure the profile has the phone number set
-      const { error: updateError } = await supabase
+      const { error: upsertError } = await supabaseAdmin
         .from('profiles')
-        .update({ phone_number: phone })
-        .eq('id', authData.user.id);
+        .upsert({
+          id: authData.user.id,
+          role: 'passenger',
+          first_name: firstName,
+          last_name: lastName,
+          phone_number: normalizedPhone
+        }, { onConflict: 'id' });
 
-      if (updateError) {
-        console.error('Error updating profile with phone:', updateError);
+      if (upsertError) {
+        console.error('Error upserting profile with phone:', upsertError);
         // Continue anyway since user was created
       }
 
-      console.log('Created new user for phone:', phone, 'userId:', authData.user.id);
+      console.log('Created new user for phone:', normalizedPhone, 'userId:', authData.user.id);
       res.status(201).json({ success: true, userId: authData.user.id });
     } else {
       console.error('SignUp succeeded but no user data returned');
