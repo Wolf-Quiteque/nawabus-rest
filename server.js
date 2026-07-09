@@ -575,29 +575,16 @@ app.get('/api/routes', async (req, res) => {
   }
 });
 
-// Helper: get all trip IDs that share the same bus + departure minute (sibling trips)
+// Helper: get all trip IDs that share the same bus and have an overlapping
+// [departure_time, arrival_time] window (sibling trips). Backed by the
+// get_overlapping_trip_ids() Postgres function so every booking surface
+// (this API, agent-web-app, agent-pwa) resolves siblings identically.
 async function getSiblingTripIds(tripId) {
-  const { data: trip } = await supabase
-    .from('trips')
-    .select('bus_id, departure_time')
-    .eq('id', tripId)
-    .single();
+  const { data: siblings, error } = await supabase
+    .rpc('get_overlapping_trip_ids', { p_trip_id: tripId });
 
-  if (!trip) return [tripId];
-
-  const d = new Date(trip.departure_time);
-  d.setSeconds(0, 0);
-  const start = d.toISOString();
-  const end = new Date(d.getTime() + 60000).toISOString();
-
-  const { data: siblings } = await supabase
-    .from('trips')
-    .select('id')
-    .eq('bus_id', trip.bus_id)
-    .gte('departure_time', start)
-    .lt('departure_time', end);
-
-  return siblings?.map(s => s.id) ?? [tripId];
+  if (error || !siblings) return [tripId];
+  return siblings.map(s => s.id);
 }
 
 // Helper function to generate reference number
@@ -680,7 +667,7 @@ app.post('/api/booking', async (req, res) => {
         .select('id')
         .in('trip_id', siblingIds)
         .eq('seat_number', seatNumber)
-        .in('status', ['active', 'pending']);
+        .in('status', ['active', 'pending', 'used']);
 
       if (ticketCheckError) throw ticketCheckError;
 
