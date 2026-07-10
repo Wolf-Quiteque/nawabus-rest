@@ -869,6 +869,27 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
       });
     }
 
+    // For split payments (TPA & Dinheiro), `splits` is an array like
+    // [{method:'tpa', amount:6000}, {method:'cash', amount:4000}] and one
+    // transaction row is created per part so reports show exactly what money
+    // went through the TPA vs cash. Parts must sum exactly to the ticket
+    // price so the ledger never disagrees with the sale amount — validated
+    // BEFORE the ticket is marked paid.
+    const validSplits = Array.isArray(splits)
+      ? splits.filter(s => s && typeof s.method === 'string' && Number.isFinite(Number(s.amount)) && Number(s.amount) > 0)
+      : [];
+
+    if (validSplits.length > 0) {
+      const splitTotal = validSplits.reduce((sum, s) => sum + Number(s.amount), 0);
+      if (Math.abs(splitTotal - Number(ticket.price_paid_usd)) > 0.01) {
+        return res.status(400).json({
+          error: 'Split amounts must sum to the ticket price',
+          expected: Number(ticket.price_paid_usd),
+          received: splitTotal
+        });
+      }
+    }
+
     // Update ticket to paid status
     const { error: updateError } = await client
       .from('tickets')
@@ -876,15 +897,6 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
       .eq('id', ticketId);
 
     if (updateError) throw updateError;
-
-    // Create payment transaction record(s).
-    // For split payments (TPA & Dinheiro), `splits` is an array like
-    // [{method:'tpa', amount:6000}, {method:'cash', amount:4000}] and one
-    // transaction row is created per part so reports show exactly what money
-    // went through the TPA vs cash.
-    const validSplits = Array.isArray(splits)
-      ? splits.filter(s => s && typeof s.method === 'string' && Number.isFinite(Number(s.amount)) && Number(s.amount) > 0)
-      : [];
 
     const txRows = validSplits.length > 0
       ? validSplits.map((s, i) => ({
