@@ -691,11 +691,14 @@ app.post('/api/booking', async (req, res) => {
       // Use seat_class from trip if not provided
       const finalSeatClass = seatClass || trip.seat_class;
 
-      // Generate reference if needed (for non-cash payments with empty/null reference)
+      // Generate reference if needed (for non-cash payments with empty/null reference).
+      // TPA payments (full or split with cash) are settled immediately at the
+      // counter, so they follow the cash path: no ProxyPay reference, no SMS.
+      const CASH_LIKE_METHODS = ['cash', 'tpa', 'tpa_dinheiro'];
       let initialReference = null;
       let shouldUpdateReference = false;
 
-      if (paymentMethod !== 'cash') {
+      if (!CASH_LIKE_METHODS.includes(paymentMethod)) {
         if (!paymentReference || paymentReference.trim() === '') {
           // Will generate and update after insert to trigger SMS
           initialReference = null;
@@ -707,10 +710,10 @@ app.post('/api/booking', async (req, res) => {
           shouldUpdateReference = true;
         }
       } else {
-        // For cash payments, set reference immediately (no SMS trigger needed)
+        // For cash-like payments, set reference immediately (no SMS trigger needed)
         initialReference = paymentReference || `agent-${Date.now()}`;
         generatedReference = initialReference;
-        shouldUpdateReference = false; // Don't trigger SMS for cash
+        shouldUpdateReference = false; // Don't trigger SMS for cash-like
       }
 
       // Step 3: Create the ticket (with NULL reference if we need to trigger SMS)
@@ -755,9 +758,9 @@ app.post('/api/booking', async (req, res) => {
         }
       }
 
-      // Step 4: Create payment transaction record only for completed payments (cash)
+      // Step 4: Create payment transaction record only for completed payments (cash-like)
       let paymentTransaction = null;
-      if (paymentMethod === 'cash' && finalPaymentStatus === 'paid') {
+      if (CASH_LIKE_METHODS.includes(paymentMethod) && finalPaymentStatus === 'paid') {
         const { data: paymentTx, error: paymentError } = await client
           .from('payment_transactions')
           .insert({
@@ -841,7 +844,7 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
     }
 
     const { ticketId } = req.params;
-    const { paymentMethod } = req.body;
+    const { paymentMethod, splits } = req.body;
 
     if (!ticketId) {
       return res.status(400).json({ error: 'Missing ticketId' });
@@ -874,17 +877,36 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
 
     if (updateError) throw updateError;
 
-    // Create payment transaction record
+    // Create payment transaction record(s).
+    // For split payments (TPA & Dinheiro), `splits` is an array like
+    // [{method:'tpa', amount:6000}, {method:'cash', amount:4000}] and one
+    // transaction row is created per part so reports show exactly what money
+    // went through the TPA vs cash.
+    const validSplits = Array.isArray(splits)
+      ? splits.filter(s => s && typeof s.method === 'string' && Number.isFinite(Number(s.amount)) && Number(s.amount) > 0)
+      : [];
+
+    const txRows = validSplits.length > 0
+      ? validSplits.map((s, i) => ({
+          ticket_id: ticketId,
+          amount_usd: Number(s.amount),
+          currency: 'USD',
+          payment_method: s.method,
+          status: 'completed',
+          transaction_id: `agent-${Date.now()}-${i}`
+        }))
+      : [{
+          ticket_id: ticketId,
+          amount_usd: ticket.price_paid_usd,
+          currency: 'USD',
+          payment_method: paymentMethod || 'cash',
+          status: 'completed',
+          transaction_id: `agent-${Date.now()}`
+        }];
+
     const { error: paymentError } = await client
       .from('payment_transactions')
-      .insert({
-        ticket_id: ticketId,
-        amount_usd: ticket.price_paid_usd,
-        currency: 'USD',
-        payment_method: paymentMethod || 'cash',
-        status: 'completed',
-        transaction_id: `agent-${Date.now()}`
-      });
+      .insert(txRows);
 
     if (paymentError) {
       console.error('Failed to create payment transaction:', paymentError);
