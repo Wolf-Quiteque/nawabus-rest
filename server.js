@@ -375,12 +375,22 @@ app.get('/api/trips', async (req, res) => {
       .eq('status', 'scheduled')
       .gt('available_seats', 0);
 
-    // Apply filters
+    // Apply filters. Terminals now sell by CITY (Kikolo, Gamek, Benguela...)
+    // so match either the city or the province — older clients that still
+    // send province names keep working.
     if (origin && origin.trim()) {
-      query = query.ilike('routes.origin_province', `%${origin.trim()}%`);
+      const o = origin.trim();
+      query = query.or(
+        `origin_province.ilike.%${o}%,origin_city.ilike.%${o}%`,
+        { foreignTable: 'routes' }
+      );
     }
     if (destination && destination.trim()) {
-      query = query.ilike('routes.destination_province', `%${destination.trim()}%`);
+      const d = destination.trim();
+      query = query.or(
+        `destination_province.ilike.%${d}%,destination_city.ilike.%${d}%`,
+        { foreignTable: 'routes' }
+      );
     }
     if (date && date.trim()) {
       // Create date range for the specified date
