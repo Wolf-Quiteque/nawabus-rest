@@ -685,6 +685,23 @@ app.post('/api/booking', async (req, res) => {
         return res.status(400).json({ error: 'Seat already taken' });
       }
 
+      // Step 1b: Also respect unexpired online-checkout holds on this seat.
+      // Without this, an agent could sell a seat a customer is mid-payment
+      // for online (reference not yet paid, so no ticket row exists yet) -
+      // the online payment then lands with nowhere to go.
+      const { data: holdConflicts, error: holdConflictsError } = await client
+        .from('online_bookings')
+        .select('id')
+        .in('trip_id', siblingIds)
+        .eq('seat_number', seatNumber)
+        .gt('expires_at', new Date().toISOString());
+
+      if (holdConflictsError) throw holdConflictsError;
+
+      if (holdConflicts && holdConflicts.length > 0) {
+        return res.status(400).json({ error: 'Seat currently reserved for an online payment' });
+      }
+
       // Step 2: Get trip details for price
       const { data: trip, error: tripError } = await client
         .from('trips')
