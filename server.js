@@ -33,6 +33,17 @@ const supabaseAdmin = supabaseServiceRoleKey
     })
   : supabase;
 
+/**
+ * Seat 1 is permanently reserved for the co-pilot and can never be sold.
+ * Mirrors public.copilot_seat_number() in the database, which rejects any
+ * ticket written to this seat. Keep the two in sync.
+ */
+const COPILOT_SEAT_NUMBER = 1;
+
+function isCopilotSeat(seatNumber) {
+  return Number(seatNumber) === COPILOT_SEAT_NUMBER;
+}
+
 function normalizePhoneNumber(phone) {
   const cleaned = String(phone || '').replace(/\D/g, '');
   if (!cleaned) return '';
@@ -539,8 +550,17 @@ app.get('/api/trips/:tripId/booked_seats', async (req, res) => {
       });
     }
 
+    // The co-pilot seat is never sellable, so it is reported as booked to
+    // every client (the Sunmi app picks its seat from whatever is left).
     const bookedSeats = seats.map(s => s.seat_number);
-    res.json({ booked_seats: bookedSeats });
+    if (!bookedSeats.some(isCopilotSeat)) {
+      bookedSeats.push(COPILOT_SEAT_NUMBER);
+    }
+
+    res.json({
+      booked_seats: bookedSeats,
+      reserved_seats: [COPILOT_SEAT_NUMBER]
+    });
 
   } catch (error) {
     console.error('Server error:', error);
@@ -658,6 +678,13 @@ app.post('/api/booking', async (req, res) => {
 
     if (!tripId || !passengerId || !seatNumber || !paymentMethod) {
       return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    if (isCopilotSeat(seatNumber)) {
+      return res.status(400).json({
+        error: 'Seat reserved for the co-pilot',
+        details: `Seat ${COPILOT_SEAT_NUMBER} is always reserved for the co-pilot and cannot be sold.`
+      });
     }
 
     // Ensure paymentStatus is valid
@@ -1308,6 +1335,13 @@ app.post('/api/mobile/booking', async (req, res) => {
     // Validation
     if (!outboundTrip || !outboundSeats || outboundSeats.length === 0 || !passengerId) {
       return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    if ([...(outboundSeats || []), ...(returnSeats || [])].some(isCopilotSeat)) {
+      return res.status(400).json({
+        error: 'Seat reserved for the co-pilot',
+        details: `Seat ${COPILOT_SEAT_NUMBER} is always reserved for the co-pilot and cannot be sold.`
+      });
     }
 
     // Validate coupon if provided
