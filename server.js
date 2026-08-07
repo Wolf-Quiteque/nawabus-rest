@@ -384,7 +384,10 @@ app.get('/api/trips', async (req, res) => {
         )
       `)
       .eq('status', 'scheduled')
-      .gt('available_seats', 0);
+      .gt('available_seats', 0)
+      // Only surface trips whose bus is still active. When an admin sets
+      // buses.is_active = false, the bus should no longer be purchasable.
+      .eq('buses.is_active', true);
 
     // Apply filters. Terminals now sell by CITY (Kikolo, Gamek, Benguela...)
     // so match either the city or the province — older clients that still
@@ -496,6 +499,7 @@ app.get('/api/trips/:tripId', async (req, res) => {
           license_plate,
           capacity,
           amenities,
+          is_active,
           companies!inner (
             name,
             license_number,
@@ -516,6 +520,12 @@ app.get('/api/trips/:tripId', async (req, res) => {
         error: 'Database error',
         details: error.message
       });
+    }
+
+    // Hide trips whose bus has been deactivated (is_active = false).
+    const tripBus = Array.isArray(trip.buses) ? trip.buses[0] : trip.buses;
+    if (tripBus && tripBus.is_active === false) {
+      return res.status(404).json({ error: 'Trip not available' });
     }
 
     res.json({ trip });
@@ -729,14 +739,24 @@ app.post('/api/booking', async (req, res) => {
         return res.status(400).json({ error: 'Seat currently reserved for an online payment' });
       }
 
-      // Step 2: Get trip details for price
+      // Step 2: Get trip details for price (and confirm the bus is still
+      // active — an admin can set buses.is_active = false to stop sales).
       const { data: trip, error: tripError } = await client
         .from('trips')
-        .select('price_usd, available_seats, seat_class')
+        .select('price_usd, available_seats, seat_class, buses(is_active)')
         .eq('id', tripId)
         .single();
 
       if (tripError || !trip) throw tripError || new Error('Trip not found');
+
+      // Bus deactivated -> no one can purchase a seat on it anymore.
+      const tripBus = Array.isArray(trip.buses) ? trip.buses[0] : trip.buses;
+      if (tripBus && tripBus.is_active === false) {
+        return res.status(400).json({
+          success: false,
+          error: 'Bus not available'
+        });
+      }
 
       if (trip.available_seats <= 0) {
         return res.status(400).json({ error: 'No seats available' });
