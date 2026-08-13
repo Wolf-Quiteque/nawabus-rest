@@ -44,6 +44,44 @@ function isCopilotSeat(seatNumber) {
   return Number(seatNumber) === COPILOT_SEAT_NUMBER;
 }
 
+// A bus can sell several route segments during one physical run. Availability
+// must therefore be derived from the bus capacity and every overlapping trip,
+// never from an individual trip's cached available_seats value.
+async function applySharedBusAvailability(trips, client = supabaseAdmin) {
+  if (!trips?.length) return trips || [];
+
+  const siblingsByTrip = new Map();
+  await Promise.all(trips.map(async (trip) => {
+    const { data, error } = await client.rpc('get_overlapping_trip_ids', { p_trip_id: trip.id });
+    if (error) throw error;
+    siblingsByTrip.set(trip.id, data?.map((row) => row.id) || [trip.id]);
+  }));
+
+  const siblingIds = [...new Set([...siblingsByTrip.values()].flat())];
+  const now = new Date().toISOString();
+  const [{ data: tickets, error: ticketsError }, { data: holds, error: holdsError }] = await Promise.all([
+    client.from('tickets').select('trip_id, seat_number').in('trip_id', siblingIds).in('status', ['active', 'pending', 'used']),
+    client.from('online_bookings').select('trip_id, seat_number').in('trip_id', siblingIds).gt('expires_at', now),
+  ]);
+  if (ticketsError || holdsError) throw ticketsError || holdsError;
+
+  const seatsByTrip = new Map();
+  for (const row of [...(tickets || []), ...(holds || [])]) {
+    if (!seatsByTrip.has(row.trip_id)) seatsByTrip.set(row.trip_id, new Set());
+    seatsByTrip.get(row.trip_id).add(row.seat_number);
+  }
+
+  return trips.map((trip) => {
+    const occupied = new Set();
+    for (const siblingId of siblingsByTrip.get(trip.id) || [trip.id]) {
+      for (const seat of seatsByTrip.get(siblingId) || []) occupied.add(seat);
+    }
+    const bus = Array.isArray(trip.buses) ? trip.buses[0] : trip.buses;
+    const capacity = Number(bus?.capacity || 0);
+    return { ...trip, available_seats: Math.max(capacity - 1 - occupied.size, 0) };
+  });
+}
+
 function normalizePhoneNumber(phone) {
   const cleaned = String(phone || '').replace(/\D/g, '');
   if (!cleaned) return '';
@@ -384,7 +422,6 @@ app.get('/api/trips', async (req, res) => {
         )
       `)
       .eq('status', 'scheduled')
-      .gt('available_seats', 0)
       // Only surface trips whose bus is still active. When an admin sets
       // buses.is_active = false, the bus should no longer be purchasable.
       .eq('buses.is_active', true);
@@ -442,14 +479,17 @@ app.get('/api/trips', async (req, res) => {
       });
     }
 
-    console.log(`Found ${trips?.length || 0} trips`);
+    const tripsWithSharedAvailability = await applySharedBusAvailability(trips || []);
+    const sellableTrips = tripsWithSharedAvailability.filter((trip) => trip.available_seats > 0);
+
+    console.log(`Found ${sellableTrips.length} sellable trips`);
 
     res.json({
-      trips: trips || [],
+      trips: sellableTrips,
       pagination: {
         offset: offsetNum,
         limit: limitNum,
-        count: trips?.length || 0
+        count: sellableTrips.length
       },
       filters: {
         origin: origin || null,
@@ -743,7 +783,7 @@ app.post('/api/booking', async (req, res) => {
       // active — an admin can set buses.is_active = false to stop sales).
       const { data: trip, error: tripError } = await client
         .from('trips')
-        .select('price_usd, available_seats, seat_class, buses(is_active)')
+        .select('price_usd, seat_class, buses(is_active, capacity)')
         .eq('id', tripId)
         .single();
 
@@ -758,7 +798,28 @@ app.post('/api/booking', async (req, res) => {
         });
       }
 
-      if (trip.available_seats <= 0) {
+      // Do not trust trips.available_seats here: sibling route segments may
+      // have different cached values. The physical bus is full only when all
+      // unique seats are occupied across its overlapping trip group.
+      const [{ data: occupiedTickets, error: occupiedTicketsError }, { data: activeHolds, error: activeHoldsError }] = await Promise.all([
+        client
+          .from('tickets')
+          .select('seat_number')
+          .in('trip_id', siblingIds)
+          .in('status', ['active', 'pending', 'used']),
+        client
+          .from('online_bookings')
+          .select('seat_number')
+          .in('trip_id', siblingIds)
+          .gt('expires_at', new Date().toISOString()),
+      ]);
+      if (occupiedTicketsError || activeHoldsError) throw occupiedTicketsError || activeHoldsError;
+      const occupiedSeats = new Set([
+        ...(occupiedTickets || []).map((row) => row.seat_number),
+        ...(activeHolds || []).map((row) => row.seat_number),
+      ]);
+      const capacity = Number(tripBus?.capacity || 0);
+      if (capacity - 1 <= occupiedSeats.size) {
         return res.status(400).json({ error: 'No seats available' });
       }
 
