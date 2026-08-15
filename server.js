@@ -1,7 +1,13 @@
 import express from 'express';
 import cors from 'cors';
+import { randomUUID } from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
+import {
+  isCashLikePayment,
+  normalizePaymentSplits,
+  resolveBookingPaymentStatus,
+} from './lib/booking-payment.js';
 
 dotenv.config();
 
@@ -723,7 +729,8 @@ app.post('/api/booking', async (req, res) => {
       paymentMethod,
       paymentReference,
       paymentStatus = 'pending', // Default to pending if not provided
-      ticketNumber = null // Allow client to provide pre-generated ticket number
+      ticketNumber = null, // Allow client to provide pre-generated ticket number
+      splits = null,
     } = req.body;
 
     if (!tripId || !passengerId || !seatNumber || !paymentMethod) {
@@ -737,13 +744,14 @@ app.post('/api/booking', async (req, res) => {
       });
     }
 
-    // Ensure paymentStatus is valid
-    const validStatuses = ['pending', 'paid', 'failed', 'refunded'];
-    const finalPaymentStatus = validStatuses.includes(paymentStatus) ? paymentStatus : 'pending';
+    // Counter payments are settled before the ticket is issued. Older Sunmi
+    // builds send "pending" and then fire a non-blocking mark-paid request;
+    // finalizing here prevents a printed ticket from being left pending when
+    // that second request is lost.
+    const finalPaymentStatus = resolveBookingPaymentStatus(paymentMethod, paymentStatus);
 
     // Start transaction-like operation
     let ticketId = null;
-    let paymentTransactionId = null;
     let generatedReference = null;
 
     try {
@@ -829,11 +837,10 @@ app.post('/api/booking', async (req, res) => {
       // Generate reference if needed (for non-cash payments with empty/null reference).
       // TPA payments (full or split with cash) are settled immediately at the
       // counter, so they follow the cash path: no ProxyPay reference, no SMS.
-      const CASH_LIKE_METHODS = ['cash', 'tpa', 'tpa_dinheiro'];
       let initialReference = null;
       let shouldUpdateReference = false;
 
-      if (!CASH_LIKE_METHODS.includes(paymentMethod)) {
+      if (!isCashLikePayment(paymentMethod)) {
         if (!paymentReference || paymentReference.trim() === '') {
           // Will generate and update after insert to trigger SMS
           initialReference = null;
@@ -849,6 +856,17 @@ app.post('/api/booking', async (req, res) => {
         initialReference = paymentReference || `agent-${Date.now()}`;
         generatedReference = initialReference;
         shouldUpdateReference = false; // Don't trigger SMS for cash-like
+      }
+
+      // Newer clients can send the exact TPA/cash split in the original
+      // request. Older clients remain compatible and get one mixed-method row.
+      let normalizedSplits = [];
+      if (paymentMethod === 'tpa_dinheiro' && splits != null) {
+        try {
+          normalizedSplits = normalizePaymentSplits(splits, trip.price_usd);
+        } catch (splitError) {
+          return res.status(400).json({ error: splitError.message });
+        }
       }
 
       // Step 3: Create the ticket (with NULL reference if we need to trigger SMS)
@@ -894,24 +912,48 @@ app.post('/api/booking', async (req, res) => {
       }
 
       // Step 4: Create payment transaction record only for completed payments (cash-like)
-      let paymentTransaction = null;
-      if (CASH_LIKE_METHODS.includes(paymentMethod) && finalPaymentStatus === 'paid') {
-        const { data: paymentTx, error: paymentError } = await client
-          .from('payment_transactions')
-          .insert({
-            ticket_id: ticketId,
-            amount_usd: trip.price_usd,
-            currency: 'USD',
-            payment_method: paymentMethod,
-            status: 'completed',
-            transaction_id: paymentReference || `txn-${Date.now()}`
-          })
-          .select('id')
-          .single();
+      if (isCashLikePayment(paymentMethod) && finalPaymentStatus === 'paid') {
+        const transactionSeed = randomUUID();
+        const paymentRows = normalizedSplits.length
+          ? normalizedSplits.map((split, index) => ({
+              ticket_id: ticketId,
+              amount_usd: split.amount,
+              currency: 'USD',
+              payment_method: split.method,
+              status: 'completed',
+              transaction_id: `agent-${transactionSeed}-${index}`,
+            }))
+          : [{
+              ticket_id: ticketId,
+              amount_usd: trip.price_usd,
+              currency: 'USD',
+              payment_method: paymentMethod,
+              status: 'completed',
+              transaction_id: paymentReference || `txn-${transactionSeed}`,
+            }];
 
-        if (paymentError) throw paymentError;
-        paymentTransaction = paymentTx;
-        paymentTransactionId = paymentTx.id;
+        const { error: paymentError } = await client
+          .from('payment_transactions')
+          .insert(paymentRows);
+
+        if (paymentError) {
+          // The client must never receive/print a paid ticket without its
+          // ledger entry. Compensate the earlier insert before returning an
+          // error; if deletion itself fails, leave the ticket pending so the
+          // scanner still fails closed and accounting can reconcile it.
+          const { error: deleteError } = await client
+            .from('tickets')
+            .delete()
+            .eq('id', ticketId);
+          if (deleteError) {
+            console.error('Failed to remove ticket after payment ledger failure:', deleteError);
+            await client
+              .from('tickets')
+              .update({ payment_status: 'pending' })
+              .eq('id', ticketId);
+          }
+          throw paymentError;
+        }
       }
 
       // Step 5: Update available seats (this should be handled by trigger, but let's ensure it)
@@ -926,7 +968,9 @@ app.post('/api/booking', async (req, res) => {
           price_paid_usd: trip.price_usd,
           qr_code_data: `TKT-${tripId}-${seatNumber}`,
           ticket_number: ticket.ticket_number,
-          payment_reference: generatedReference // Return the reference number
+          payment_reference: generatedReference, // Return the reference number
+          payment_status: finalPaymentStatus,
+          payment_method: paymentMethod,
         }
       });
 
@@ -941,7 +985,7 @@ app.post('/api/booking', async (req, res) => {
   }
 });
 
-// PATCH /api/tickets/:ticketId/mark-paid - Mark ticket as paid after successful print (Hybrid approach)
+// PATCH /api/tickets/:ticketId/mark-paid - Legacy compatibility for older Sunmi builds.
 app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
   const client = supabase;
   try {
@@ -996,7 +1040,31 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
       return res.status(404).json({ error: 'Ticket not found' });
     }
 
-    // Only update if currently pending
+    const { data: existingTransactions, error: existingError } = await client
+      .from('payment_transactions')
+      .select('id')
+      .eq('ticket_id', ticketId)
+      .eq('status', 'completed');
+    if (existingError) throw existingError;
+
+    // New bookings are finalized by POST /api/booking. Older Sunmi builds still
+    // call this endpoint afterward, so treat an already-paid ticket with a
+    // completed ledger row as an idempotent success.
+    if (ticket.payment_status === 'paid') {
+      if (existingTransactions?.length) {
+        return res.json({
+          success: true,
+          message: 'Ticket already marked as paid',
+          ticket_id: ticketId,
+          already_paid: true,
+        });
+      }
+      return res.status(409).json({
+        error: 'Ticket is paid but its payment transaction is missing',
+        current_status: ticket.payment_status,
+      });
+    }
+
     if (ticket.payment_status !== 'pending') {
       return res.status(400).json({
         error: `Ticket already has status: ${ticket.payment_status}`,
@@ -1010,29 +1078,16 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
     // went through the TPA vs cash. Parts must sum exactly to the ticket
     // price so the ledger never disagrees with the sale amount — validated
     // BEFORE the ticket is marked paid.
-    const validSplits = Array.isArray(splits)
-      ? splits.filter(s => s && typeof s.method === 'string' && Number.isFinite(Number(s.amount)) && Number(s.amount) > 0)
-      : [];
-
-    if (validSplits.length > 0) {
-      const splitTotal = validSplits.reduce((sum, s) => sum + Number(s.amount), 0);
-      if (Math.abs(splitTotal - Number(ticket.price_paid_usd)) > 0.01) {
-        return res.status(400).json({
-          error: 'Split amounts must sum to the ticket price',
-          expected: Number(ticket.price_paid_usd),
-          received: splitTotal
-        });
+    let validSplits = [];
+    if (splits != null) {
+      try {
+        validSplits = normalizePaymentSplits(splits, ticket.price_paid_usd);
+      } catch (splitError) {
+        return res.status(400).json({ error: splitError.message });
       }
     }
 
-    // Update ticket to paid status
-    const { error: updateError } = await client
-      .from('tickets')
-      .update({ payment_status: 'paid' })
-      .eq('id', ticketId);
-
-    if (updateError) throw updateError;
-
+    const transactionSeed = randomUUID();
     const txRows = validSplits.length > 0
       ? validSplits.map((s, i) => ({
           ticket_id: ticketId,
@@ -1040,7 +1095,7 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
           currency: 'USD',
           payment_method: s.method,
           status: 'completed',
-          transaction_id: `agent-${Date.now()}-${i}`
+          transaction_id: `agent-${transactionSeed}-${i}`
         }))
       : [{
           ticket_id: ticketId,
@@ -1048,16 +1103,41 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
           currency: 'USD',
           payment_method: paymentMethod || 'cash',
           status: 'completed',
-          transaction_id: `agent-${Date.now()}`
+          transaction_id: `agent-${transactionSeed}`
         }];
 
-    const { error: paymentError } = await client
-      .from('payment_transactions')
-      .insert(txRows);
+    let insertedTransactionIds = [];
+    if (!existingTransactions?.length) {
+      const { data: insertedTransactions, error: paymentError } = await client
+        .from('payment_transactions')
+        .insert(txRows)
+        .select('id');
 
-    if (paymentError) {
-      console.error('Failed to create payment transaction:', paymentError);
-      // Don't throw - ticket status is already updated
+      if (paymentError) {
+        // Leave the ticket pending: the app must not print/board it as paid.
+        throw paymentError;
+      }
+      insertedTransactionIds = (insertedTransactions || []).map((row) => row.id);
+    }
+
+    // Publish paid only after the ledger exists. If this final update fails,
+    // remove the rows created by this request so a retry remains clean.
+    const { error: updateError } = await client
+      .from('tickets')
+      .update({ payment_status: 'paid' })
+      .eq('id', ticketId);
+
+    if (updateError) {
+      if (insertedTransactionIds.length) {
+        const { error: cleanupError } = await client
+          .from('payment_transactions')
+          .delete()
+          .in('id', insertedTransactionIds);
+        if (cleanupError) {
+          console.error('Failed to clean payment rows after ticket update failure:', cleanupError);
+        }
+      }
+      throw updateError;
     }
 
     // Trigger seat update (though trigger should handle this automatically)
