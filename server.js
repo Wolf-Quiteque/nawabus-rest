@@ -5,6 +5,9 @@ import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import {
   isCashLikePayment,
+  isSellableSeatNumber,
+  isSupportedBookingPayment,
+  normalizeSeatNumber,
   normalizePaymentSplits,
   resolveBookingPaymentStatus,
 } from './lib/booking-payment.js';
@@ -50,6 +53,30 @@ function isCopilotSeat(seatNumber) {
   return Number(seatNumber) === COPILOT_SEAT_NUMBER;
 }
 
+async function authenticateAgentRequest(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return { error: 'No access token provided', status: 401 };
+  }
+
+  const accessToken = authHeader.substring(7);
+  const { data: { user }, error: verifyError } = await supabase.auth.getUser(accessToken);
+  if (verifyError || !user) {
+    return { error: 'Invalid or expired token', status: 401 };
+  }
+
+  const { data: profile, error: profileError } = await supabaseAdmin
+    .from('profiles')
+    .select('role')
+    .eq('id', user.id)
+    .single();
+  if (profileError || !profile || !['agent', 'admin'].includes(profile.role)) {
+    return { error: 'Unauthorized: Only agents can perform this operation', status: 403 };
+  }
+
+  return { user, profile };
+}
+
 // A bus can sell several route segments during one physical run. Availability
 // must therefore be derived from the bus capacity and every overlapping trip,
 // never from an individual trip's cached available_seats value.
@@ -84,7 +111,8 @@ async function applySharedBusAvailability(trips, client = supabaseAdmin) {
     }
     const bus = Array.isArray(trip.buses) ? trip.buses[0] : trip.buses;
     const capacity = Number(bus?.capacity || 0);
-    return { ...trip, available_seats: Math.max(capacity - 1 - occupied.size, 0) };
+    const occupiedPassengerSeats = [...occupied].filter((seat) => !isCopilotSeat(seat));
+    return { ...trip, available_seats: Math.max(capacity - 1 - occupiedPassengerSeats.length, 0) };
   });
 }
 
@@ -733,11 +761,20 @@ app.post('/api/booking', async (req, res) => {
       splits = null,
     } = req.body;
 
-    if (!tripId || !passengerId || !seatNumber || !paymentMethod) {
+    if (!tripId || !passengerId || seatNumber == null || !paymentMethod) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    if (isCopilotSeat(seatNumber)) {
+    const normalizedSeatNumber = normalizeSeatNumber(seatNumber);
+    if (normalizedSeatNumber === null) {
+      return res.status(400).json({ error: 'Seat number must be an integer' });
+    }
+
+    if (!isSupportedBookingPayment(paymentMethod)) {
+      return res.status(400).json({ error: 'Unsupported payment method' });
+    }
+
+    if (isCopilotSeat(normalizedSeatNumber)) {
       return res.status(400).json({
         error: 'Seat reserved for the co-pilot',
         details: `Seat ${COPILOT_SEAT_NUMBER} is always reserved for the co-pilot and cannot be sold.`
@@ -755,13 +792,42 @@ app.post('/api/booking', async (req, res) => {
     let generatedReference = null;
 
     try {
+      // A locally generated ticket number is the Sunmi request's stable key.
+      // If the terminal retries after a timeout, return the ticket already
+      // created by that same agent instead of creating a second sale.
+      if (ticketNumber) {
+        const normalizedTicketNumber = String(ticketNumber).trim();
+        const { data: retryTicket, error: retryError } = await client
+          .from('tickets')
+          .select('id, ticket_number, trip_id, passenger_id, booked_by, seat_number, price_paid_usd, payment_reference, payment_status, payment_method, qr_code_data')
+          .eq('ticket_number', normalizedTicketNumber)
+          .maybeSingle();
+        if (retryError) throw retryError;
+
+        if (retryTicket) {
+          const sameBooking = retryTicket.booked_by === bookedBy &&
+            retryTicket.trip_id === tripId &&
+            retryTicket.passenger_id === passengerId &&
+            Number(retryTicket.seat_number) === normalizedSeatNumber;
+          if (!sameBooking) {
+            return res.status(409).json({ error: 'Ticket number already belongs to another booking' });
+          }
+
+          return res.status(200).json({
+            success: true,
+            idempotent: true,
+            ticket: retryTicket,
+          });
+        }
+      }
+
       // Step 1: Check if seat is available across all sibling trips (same bus + departure minute)
       const siblingIds = await getSiblingTripIds(tripId);
       const { data: existingTicket, error: ticketCheckError } = await client
         .from('tickets')
         .select('id')
         .in('trip_id', siblingIds)
-        .eq('seat_number', seatNumber)
+        .eq('seat_number', normalizedSeatNumber)
         .in('status', ['active', 'pending', 'used']);
 
       if (ticketCheckError) throw ticketCheckError;
@@ -778,7 +844,7 @@ app.post('/api/booking', async (req, res) => {
         .from('online_bookings')
         .select('id')
         .in('trip_id', siblingIds)
-        .eq('seat_number', seatNumber)
+        .eq('seat_number', normalizedSeatNumber)
         .gt('expires_at', new Date().toISOString());
 
       if (holdConflictsError) throw holdConflictsError;
@@ -826,7 +892,14 @@ app.post('/api/booking', async (req, res) => {
         ...(occupiedTickets || []).map((row) => row.seat_number),
         ...(activeHolds || []).map((row) => row.seat_number),
       ]);
+      occupiedSeats.delete(COPILOT_SEAT_NUMBER);
       const capacity = Number(tripBus?.capacity || 0);
+      if (!isSellableSeatNumber(normalizedSeatNumber, capacity)) {
+        return res.status(400).json({
+          error: 'Seat is outside the sellable passenger range',
+          details: `Seat must be between 2 and ${capacity}.`,
+        });
+      }
       if (capacity - 1 <= occupiedSeats.size) {
         return res.status(400).json({ error: 'No seats available' });
       }
@@ -876,12 +949,12 @@ app.post('/api/booking', async (req, res) => {
         booked_by: bookedBy, // Agent who sold the ticket
         booking_source: 'mobile_app', // Since this is for the separate app
         seat_class: finalSeatClass,
-        seat_number: seatNumber,
+        seat_number: normalizedSeatNumber,
         price_paid_usd: trip.price_usd,
         payment_status: finalPaymentStatus,
         payment_method: paymentMethod,
         payment_reference: initialReference, // NULL for non-cash without reference
-        qr_code_data: `TKT-${tripId}-${seatNumber}` // Simple QR data
+        qr_code_data: `TKT-${tripId}-${normalizedSeatNumber}` // Simple QR data
       };
 
       // Add ticket_number if provided by client (hybrid approach)
@@ -929,7 +1002,7 @@ app.post('/api/booking', async (req, res) => {
               currency: 'USD',
               payment_method: paymentMethod,
               status: 'completed',
-              transaction_id: paymentReference || `txn-${transactionSeed}`,
+              transaction_id: `txn-${transactionSeed}`,
             }];
 
         const { error: paymentError } = await client
@@ -964,9 +1037,9 @@ app.post('/api/booking', async (req, res) => {
         ticket: {
           id: ticket.id,
           trip_id: tripId,
-          seat_number: seatNumber,
+          seat_number: normalizedSeatNumber,
           price_paid_usd: trip.price_usd,
-          qr_code_data: `TKT-${tripId}-${seatNumber}`,
+          qr_code_data: `TKT-${tripId}-${normalizedSeatNumber}`,
           ticket_number: ticket.ticket_number,
           payment_reference: generatedReference, // Return the reference number
           payment_status: finalPaymentStatus,
@@ -981,7 +1054,8 @@ app.post('/api/booking', async (req, res) => {
 
   } catch (error) {
     console.error('Booking error:', error);
-    res.status(500).json({ error: 'Booking failed', details: error.message });
+    const status = error?.code === '23505' ? 409 : error?.code === '23514' ? 400 : 500;
+    res.status(status).json({ error: 'Booking failed', details: error.message });
   }
 });
 
@@ -1032,12 +1106,16 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
     // Fetch the ticket to get price and trip_id
     const { data: ticket, error: ticketError } = await client
       .from('tickets')
-      .select('id, price_paid_usd, trip_id, payment_status')
+      .select('id, price_paid_usd, trip_id, payment_status, payment_method, booked_by')
       .eq('id', ticketId)
       .single();
 
     if (ticketError || !ticket) {
       return res.status(404).json({ error: 'Ticket not found' });
+    }
+
+    if (profile.role !== 'admin' && ticket.booked_by !== user.id) {
+      return res.status(403).json({ error: 'Agents can only finalize their own ticket sales' });
     }
 
     const { data: existingTransactions, error: existingError } = await client
@@ -1155,37 +1233,12 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
   }
 });
 
-// POST /api/payment - Handle payment (placeholder for future payment integration)kkk
-app.post('/api/payment', async (req, res) => {
-  try {
-    const { amount, method, reference, ticketId } = req.body;
-
-    // For now, just simulate payment processing
-    // In a real implementation, you'd integrate with a payment processor
-
-    // Update ticket payment status if ticketId provided
-    if (ticketId) {
-      const { error } = await supabase
-        .from('tickets')
-        .update({
-          payment_status: 'paid',
-          payment_method: method,
-          payment_reference: reference
-        })
-        .eq('id', ticketId);
-
-      if (error) throw error;
-    }
-
-    res.json({
-      success: true,
-      transaction_id: reference || `txn-${Date.now()}`,
-      status: 'completed'
-    });
-  } catch (error) {
-    console.error('Payment error:', error);
-    res.status(500).json({ error: 'Payment processing failed' });
-  }
+// POST /api/payment - Removed unsafe legacy simulator. It accepted arbitrary
+// ticket IDs and could mark them paid without authentication or a ledger row.
+app.post('/api/payment', (_req, res) => {
+  res.status(410).json({
+    error: 'This payment endpoint is retired. Use /api/booking or the authenticated mark-paid endpoint.',
+  });
 });
 
 // GET /api/tickets/by-reference/:ref - Look up a ticket by payment_reference
@@ -1219,15 +1272,21 @@ app.patch('/api/tickets/:ticketId/update-status', async (req, res) => {
     const { ticketId } = req.params;
     const { payment_status } = req.body;
 
-    if (!payment_status || !['paid', 'pending', 'failed', 'refunded'].includes(payment_status)) {
-      return res.status(400).json({ error: 'Invalid payment status' });
+    const auth = await authenticateAgentRequest(req);
+    if (auth.error) {
+      return res.status(auth.status).json({ success: false, error: auth.error });
     }
 
-    const { data: ticket, error } = await supabase
+    // The Sunmi legacy client only uses this endpoint to finalize a counter
+    // payment. Other status transitions belong to the authenticated admin flow.
+    if (payment_status !== 'paid') {
+      return res.status(400).json({ error: 'This endpoint only supports marking a ticket as paid' });
+    }
+
+    const { data: ticket, error } = await supabaseAdmin
       .from('tickets')
-      .update({ payment_status })
+      .select('id, booked_by, payment_status, payment_method, price_paid_usd, ticket_number')
       .eq('id', ticketId)
-      .select('id, payment_status, ticket_number')
       .single();
 
     if (error) {
@@ -1241,36 +1300,72 @@ app.patch('/api/tickets/:ticketId/update-status', async (req, res) => {
       });
     }
 
-    // If marking as paid, also create payment transaction if it doesn't exist
-    if (payment_status === 'paid') {
-      const { data: ticketWithTrip } = await supabase
-        .from('tickets')
-        .select('price_paid_usd, trip_id')
-        .eq('id', ticketId)
-        .single();
+    if (auth.profile.role !== 'admin' && ticket.booked_by !== auth.user.id) {
+      return res.status(403).json({ error: 'Agents can only finalize their own ticket sales' });
+    }
 
-      // Check if payment transaction already exists
-      const { data: existingTx } = await supabase
-        .from('payment_transactions')
-        .select('id')
-        .eq('ticket_id', ticketId)
-        .single();
+    const { data: existingTransactions, error: existingError } = await supabaseAdmin
+      .from('payment_transactions')
+      .select('id')
+      .eq('ticket_id', ticketId)
+      .eq('status', 'completed');
+    if (existingError) throw existingError;
 
-      if (!existingTx) {
-        await supabase
-          .from('payment_transactions')
-          .insert({
-            ticket_id: ticketId,
-            amount_usd: ticketWithTrip.price_paid_usd,
-            currency: 'USD',
-            payment_method: 'cash', // Assuming cash for this update
-            status: 'completed',
-            transaction_id: `cash-${Date.now()}`
-          });
-
-        // Update trip available seats
-        await supabase.rpc('update_available_seats', {});
+    if (ticket.payment_status === 'paid') {
+      if (existingTransactions?.length) {
+        return res.json({
+          success: true,
+          already_paid: true,
+          ticket: {
+            id: ticket.id,
+            payment_status: ticket.payment_status,
+            ticket_number: ticket.ticket_number,
+          },
+        });
       }
+
+      return res.status(409).json({
+        error: 'Ticket is paid but its payment transaction is missing',
+        current_status: ticket.payment_status,
+      });
+    }
+
+    if (ticket.payment_status !== 'pending') {
+      return res.status(409).json({
+        error: `Ticket already has status: ${ticket.payment_status}`,
+        current_status: ticket.payment_status,
+      });
+    }
+
+    const { data: insertedTransaction, error: paymentError } = await supabaseAdmin
+      .from('payment_transactions')
+      .insert({
+        ticket_id: ticketId,
+        amount_usd: ticket.price_paid_usd,
+        currency: 'USD',
+        payment_method: ticket.payment_method || 'cash',
+        status: 'completed',
+        transaction_id: `legacy-${randomUUID()}`,
+      })
+      .select('id')
+      .single();
+    if (paymentError) throw paymentError;
+
+    const { data: updatedRows, error: updateError } = await supabaseAdmin
+      .from('tickets')
+      .update({ payment_status: 'paid' })
+      .eq('id', ticketId)
+      .eq('payment_status', 'pending')
+      .select('id');
+
+    if (updateError || !updatedRows?.length) {
+      await supabaseAdmin
+        .from('payment_transactions')
+        .delete()
+        .eq('id', insertedTransaction.id);
+
+      if (updateError) throw updateError;
+      return res.status(409).json({ error: 'Ticket payment status changed concurrently; retry the request' });
     }
 
     res.json({
@@ -1284,7 +1379,7 @@ app.patch('/api/tickets/:ticketId/update-status', async (req, res) => {
 
   } catch (error) {
     console.error('Update ticket status error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error', details: error.message });
   }
 });
 
