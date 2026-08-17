@@ -5,12 +5,21 @@ import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import {
   isCashLikePayment,
-  isSellableSeatNumber,
   isSupportedBookingPayment,
   normalizeSeatNumber,
   normalizePaymentSplits,
   resolveBookingPaymentStatus,
 } from './lib/booking-payment.js';
+import {
+  applyAvailabilityRows,
+  calculateSeatAvailability,
+  getTripSeatAvailability,
+} from './lib/seat-availability.js';
+import {
+  bookingErrorStatus,
+  normalizeAtomicBookingResult,
+  resolveIdempotencyKey,
+} from './lib/booking-response.js';
 
 dotenv.config();
 
@@ -77,10 +86,7 @@ async function authenticateAgentRequest(req) {
   return { user, profile };
 }
 
-// A bus can sell several route segments during one physical run. Availability
-// must therefore be derived from the bus capacity and every overlapping trip,
-// never from an individual trip's cached available_seats value.
-async function applySharedBusAvailability(trips, client = supabaseAdmin) {
+async function legacySharedBusAvailability(trips, client) {
   if (!trips?.length) return trips || [];
 
   const siblingsByTrip = new Map();
@@ -93,27 +99,47 @@ async function applySharedBusAvailability(trips, client = supabaseAdmin) {
   const siblingIds = [...new Set([...siblingsByTrip.values()].flat())];
   const now = new Date().toISOString();
   const [{ data: tickets, error: ticketsError }, { data: holds, error: holdsError }] = await Promise.all([
-    client.from('tickets').select('trip_id, seat_number').in('trip_id', siblingIds).in('status', ['active', 'pending', 'used']),
-    client.from('online_bookings').select('trip_id, seat_number').in('trip_id', siblingIds).gt('expires_at', now),
+    client.from('tickets').select('trip_id, seat_number, status').in('trip_id', siblingIds).in('status', ['active', 'pending', 'used']),
+    client.from('online_bookings').select('trip_id, seat_number, expires_at').in('trip_id', siblingIds).gt('expires_at', now),
   ]);
   if (ticketsError || holdsError) throw ticketsError || holdsError;
 
-  const seatsByTrip = new Map();
-  for (const row of [...(tickets || []), ...(holds || [])]) {
-    if (!seatsByTrip.has(row.trip_id)) seatsByTrip.set(row.trip_id, new Set());
-    seatsByTrip.get(row.trip_id).add(row.seat_number);
-  }
-
   return trips.map((trip) => {
-    const occupied = new Set();
+    const siblingTickets = [];
+    const siblingHolds = [];
     for (const siblingId of siblingsByTrip.get(trip.id) || [trip.id]) {
-      for (const seat of seatsByTrip.get(siblingId) || []) occupied.add(seat);
+      siblingTickets.push(...(tickets || []).filter((row) => row.trip_id === siblingId));
+      siblingHolds.push(...(holds || []).filter((row) => row.trip_id === siblingId));
     }
     const bus = Array.isArray(trip.buses) ? trip.buses[0] : trip.buses;
-    const capacity = Number(bus?.capacity || 0);
-    const occupiedPassengerSeats = [...occupied].filter((seat) => !isCopilotSeat(seat));
-    return { ...trip, available_seats: Math.max(capacity - 1 - occupiedPassengerSeats.length, 0) };
+    const availability = calculateSeatAvailability({
+      capacity: bus?.capacity,
+      ticketRows: siblingTickets,
+      holdRows: siblingHolds,
+      copilotSeatNumber: COPILOT_SEAT_NUMBER,
+    });
+    return { ...trip, available_seats: availability.availableSeats };
   });
+}
+
+// A bus can sell several overlapping route segments during one physical run.
+// Resolve all requested trips in one set-based RPC instead of issuing one RPC
+// per trip (the Sunmi sync requests up to 1,000 trips at a time).
+async function applySharedBusAvailability(trips, client = supabaseAdmin) {
+  if (!trips?.length) return trips || [];
+
+  try {
+    const availabilityRows = await getTripSeatAvailability(trips.map((trip) => trip.id), client);
+    return applyAvailabilityRows(trips, availabilityRows);
+  } catch (error) {
+    // This fallback keeps deployment ordering safe if the API reaches Vercel
+    // before the database migration. It is intentionally temporary/slow.
+    if (['PGRST202', '42883'].includes(error?.code)) {
+      console.warn('Batched availability RPC is not installed; using legacy availability queries');
+      return legacySharedBusAvailability(trips, client);
+    }
+    throw error;
+  }
 }
 
 function normalizePhoneNumber(phone) {
@@ -478,28 +504,38 @@ app.get('/api/trips', async (req, res) => {
       );
     }
     if (date && date.trim()) {
-      // Create date range for the specified date
-      const searchDate = new Date(date.trim());
-      const startOfDay = new Date(searchDate);
-      startOfDay.setHours(0, 0, 0, 0);
-      const endOfDay = new Date(searchDate);
-      endOfDay.setHours(23, 59, 59, 999);
+      const localDate = date.trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(localDate)) {
+        return res.status(400).json({ error: 'Date must use YYYY-MM-DD format' });
+      }
+      // Vercel runs in UTC, while terminals search by the Angola calendar day.
+      const startOfDay = new Date(`${localDate}T00:00:00.000+01:00`);
+      const endOfDay = new Date(`${localDate}T23:59:59.999+01:00`);
+      if (Number.isNaN(startOfDay.getTime()) || Number.isNaN(endOfDay.getTime())) {
+        return res.status(400).json({ error: 'Invalid date' });
+      }
 
       query = query
         .gte('departure_time', startOfDay.toISOString())
         .lte('departure_time', endOfDay.toISOString());
+    } else {
+      // The terminal's periodic sync intentionally omits a date. Do not send
+      // stale rows that were never moved out of "scheduled" after departure.
+      query = query.gte('departure_time', new Date().toISOString());
     }
     if (seatClass && seatClass.trim()) {
       query = query.eq('seat_class', seatClass.trim());
     }
 
     // Sorting
+    const allowedSortFields = new Set(['departure_time', 'arrival_time', 'price_usd', 'seat_class']);
+    const sortField = allowedSortFields.has(sort) ? sort : 'departure_time';
     const sortOrder = order.toLowerCase() === 'desc' ? { ascending: false } : { ascending: true };
-    query = query.order(sort, sortOrder);
+    query = query.order(sortField, sortOrder);
 
     // Pagination
-    const limitNum = parseInt(limit) || 50;
-    const offsetNum = parseInt(offset) || 0;
+    const limitNum = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 1000);
+    const offsetNum = Math.max(parseInt(offset, 10) || 0, 0);
     query = query.range(offsetNum, offsetNum + limitNum - 1);
 
     const { data: trips, error, count } = await query;
@@ -602,7 +638,8 @@ app.get('/api/trips/:tripId', async (req, res) => {
       return res.status(404).json({ error: 'Trip not available' });
     }
 
-    res.json({ trip });
+    const [tripWithSharedAvailability] = await applySharedBusAvailability([trip]);
+    res.json({ trip: tripWithSharedAvailability });
   } catch (error) {
     console.error('Server error:', error);
     res.status(500).json({
@@ -617,26 +654,43 @@ app.get('/api/trips/:tripId/booked_seats', async (req, res) => {
   try {
     const { tripId } = req.params;
 
-    // Resolve all sibling trip IDs (same bus + departure minute)
-    const siblingIds = await getSiblingTripIds(tripId);
+    let availabilityRows;
+    try {
+      availabilityRows = await getTripSeatAvailability([tripId], supabaseAdmin);
+    } catch (error) {
+      if (!['PGRST202', '42883'].includes(error?.code)) throw error;
 
-    const { data: seats, error } = await supabase
-      .from('tickets')
-      .select('seat_number')
-      .in('trip_id', siblingIds)
-      .in('status', ['active', 'used', 'pending']); // Include pending and used tickets as booked
-
-    if (error) {
-      console.error('Supabase error:', error);
-      return res.status(500).json({
-        error: 'Database error',
-        details: error.message
+      const siblingIds = await getSiblingTripIds(tripId);
+      const now = new Date().toISOString();
+      const [{ data: tickets, error: ticketsError }, { data: holds, error: holdsError }] = await Promise.all([
+        supabaseAdmin
+          .from('tickets')
+          .select('seat_number, status')
+          .in('trip_id', siblingIds)
+          .in('status', ['active', 'pending', 'used']),
+        supabaseAdmin
+          .from('online_bookings')
+          .select('seat_number, expires_at')
+          .in('trip_id', siblingIds)
+          .gt('expires_at', now),
+      ]);
+      if (ticketsError || holdsError) throw ticketsError || holdsError;
+      const fallback = calculateSeatAvailability({
+        capacity: 0,
+        ticketRows: tickets || [],
+        holdRows: holds || [],
+        copilotSeatNumber: COPILOT_SEAT_NUMBER,
       });
+      availabilityRows = [{ trip_id: tripId, occupied_seats: fallback.occupiedSeats }];
+    }
+    if (!availabilityRows.length) {
+      return res.status(404).json({ error: 'Trip not found' });
     }
 
     // The co-pilot seat is never sellable, so it is reported as booked to
     // every client (the Sunmi app picks its seat from whatever is left).
-    const bookedSeats = seats.map(s => s.seat_number);
+    // Active online holds are included too, matching booking validation.
+    const bookedSeats = (availabilityRows[0].occupied_seats || []).map(Number);
     if (!bookedSeats.some(isCopilotSeat)) {
       bookedSeats.push(COPILOT_SEAT_NUMBER);
     }
@@ -708,46 +762,13 @@ function generateReferenceCode() {
   return ts.slice(-8) + tail;
 }
 
-// POST /api/booking - Book a trip
+// POST /api/booking - Atomically create or recover an agent booking
 app.post('/api/booking', async (req, res) => {
-  const client = supabase;
   try {
-    // Verify authentication
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        error: 'No access token provided'
-      });
+    const auth = await authenticateAgentRequest(req);
+    if (auth.error) {
+      return res.status(auth.status).json({ success: false, error: auth.error });
     }
-
-    const accessToken = authHeader.substring(7); // Remove 'Bearer ' prefix
-
-    // Verify the session with Supabase
-    const { data: { user }, error: verifyError } = await supabase.auth.getUser(accessToken);
-
-    if (verifyError || !user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid or expired token'
-      });
-    }
-
-    // Check agent role
-    const { data: profile, error: profileError } = await supabase
-      .from('profiles')
-      .select('role')
-      .eq('id', user.id)
-      .single();
-
-    if (profileError || !profile || (!['agent', 'admin'].includes(profile.role))) {
-      return res.status(403).json({
-        success: false,
-        error: 'Unauthorized: Only agents can book tickets through this endpoint'
-      });
-    }
-
-    const bookedBy = user.id; // Agent who is booking the ticket
 
     const {
       tripId,
@@ -756,8 +777,8 @@ app.post('/api/booking', async (req, res) => {
       seatClass,
       paymentMethod,
       paymentReference,
-      paymentStatus = 'pending', // Default to pending if not provided
-      ticketNumber = null, // Allow client to provide pre-generated ticket number
+      paymentStatus = 'pending',
+      ticketNumber = null,
       splits = null,
     } = req.body;
 
@@ -777,285 +798,85 @@ app.post('/api/booking', async (req, res) => {
     if (isCopilotSeat(normalizedSeatNumber)) {
       return res.status(400).json({
         error: 'Seat reserved for the co-pilot',
-        details: `Seat ${COPILOT_SEAT_NUMBER} is always reserved for the co-pilot and cannot be sold.`
+        details: 'Seat ' + COPILOT_SEAT_NUMBER + ' is always reserved for the co-pilot and cannot be sold.',
       });
     }
 
-    // Counter payments are settled before the ticket is issued. Older Sunmi
-    // builds send "pending" and then fire a non-blocking mark-paid request;
-    // finalizing here prevents a printed ticket from being left pending when
-    // that second request is lost.
+    const normalizedTicketNumber = String(ticketNumber || '').trim() || null;
+    const normalizedPaymentReference = String(paymentReference || '').trim() || null;
+    const idempotencyKey = resolveIdempotencyKey({
+      headerValue: req.get('Idempotency-Key'),
+      ticketNumber: normalizedTicketNumber,
+      paymentReference: normalizedPaymentReference,
+    });
+    if (!idempotencyKey) {
+      return res.status(400).json({
+        error: 'A stable Idempotency-Key, ticketNumber, or paymentReference is required',
+      });
+    }
+    if (idempotencyKey.length > 200) {
+      return res.status(400).json({ error: 'Idempotency key must not exceed 200 characters' });
+    }
+
+    let normalizedSplits = [];
+    if (paymentMethod === 'tpa_dinheiro' && splits != null) {
+      if (!Array.isArray(splits) || !splits.length) {
+        return res.status(400).json({ error: 'Split payment must contain at least one part' });
+      }
+      normalizedSplits = splits.map((split) => ({
+        method: split?.method,
+        amount: Number(split?.amount),
+      }));
+      if (normalizedSplits.some((split) =>
+        !['cash', 'tpa'].includes(split.method) ||
+        !Number.isFinite(split.amount) ||
+        split.amount <= 0
+      )) {
+        return res.status(400).json({
+          error: 'Split payment parts must use cash/TPA and positive amounts',
+        });
+      }
+    }
+
+    // Counter payments commit as paid with their ledger row in the same
+    // database transaction. A reference payment remains in its requested state.
     const finalPaymentStatus = resolveBookingPaymentStatus(paymentMethod, paymentStatus);
+    const finalReference = normalizedPaymentReference || (
+      isCashLikePayment(paymentMethod)
+        ? 'agent-' + idempotencyKey
+        : generateReferenceCode()
+    );
 
-    // Start transaction-like operation
-    let ticketId = null;
-    let generatedReference = null;
+    const { data, error } = await supabaseAdmin.rpc('book_agent_ticket_atomic', {
+      p_trip_id: tripId,
+      p_passenger_id: passengerId,
+      p_booked_by: auth.user.id,
+      p_seat_number: normalizedSeatNumber,
+      p_payment_method: paymentMethod,
+      p_payment_status: finalPaymentStatus,
+      p_idempotency_key: idempotencyKey,
+      p_seat_class: seatClass || null,
+      p_payment_reference: finalReference,
+      p_ticket_number: normalizedTicketNumber,
+      p_splits: normalizedSplits,
+    });
+    if (error) throw error;
 
-    try {
-      // A locally generated ticket number is the Sunmi request's stable key.
-      // If the terminal retries after a timeout, return the ticket already
-      // created by that same agent instead of creating a second sale.
-      if (ticketNumber) {
-        const normalizedTicketNumber = String(ticketNumber).trim();
-        const { data: retryTicket, error: retryError } = await client
-          .from('tickets')
-          .select('id, ticket_number, trip_id, passenger_id, booked_by, seat_number, price_paid_usd, payment_reference, payment_status, payment_method, qr_code_data')
-          .eq('ticket_number', normalizedTicketNumber)
-          .maybeSingle();
-        if (retryError) throw retryError;
-
-        if (retryTicket) {
-          const sameBooking = retryTicket.booked_by === bookedBy &&
-            retryTicket.trip_id === tripId &&
-            retryTicket.passenger_id === passengerId &&
-            Number(retryTicket.seat_number) === normalizedSeatNumber;
-          if (!sameBooking) {
-            return res.status(409).json({ error: 'Ticket number already belongs to another booking' });
-          }
-
-          return res.status(200).json({
-            success: true,
-            idempotent: true,
-            ticket: retryTicket,
-          });
-        }
-      }
-
-      // Step 1: Check if seat is available across all sibling trips (same bus + departure minute)
-      const siblingIds = await getSiblingTripIds(tripId);
-      const { data: existingTicket, error: ticketCheckError } = await client
-        .from('tickets')
-        .select('id')
-        .in('trip_id', siblingIds)
-        .eq('seat_number', normalizedSeatNumber)
-        .in('status', ['active', 'pending', 'used']);
-
-      if (ticketCheckError) throw ticketCheckError;
-
-      if (existingTicket && existingTicket.length > 0) {
-        return res.status(400).json({ error: 'Seat already taken' });
-      }
-
-      // Step 1b: Also respect unexpired online-checkout holds on this seat.
-      // Without this, an agent could sell a seat a customer is mid-payment
-      // for online (reference not yet paid, so no ticket row exists yet) -
-      // the online payment then lands with nowhere to go.
-      const { data: holdConflicts, error: holdConflictsError } = await client
-        .from('online_bookings')
-        .select('id')
-        .in('trip_id', siblingIds)
-        .eq('seat_number', normalizedSeatNumber)
-        .gt('expires_at', new Date().toISOString());
-
-      if (holdConflictsError) throw holdConflictsError;
-
-      if (holdConflicts && holdConflicts.length > 0) {
-        return res.status(400).json({ error: 'Seat currently reserved for an online payment' });
-      }
-
-      // Step 2: Get trip details for price (and confirm the bus is still
-      // active — an admin can set buses.is_active = false to stop sales).
-      const { data: trip, error: tripError } = await client
-        .from('trips')
-        .select('price_usd, seat_class, buses(is_active, capacity)')
-        .eq('id', tripId)
-        .single();
-
-      if (tripError || !trip) throw tripError || new Error('Trip not found');
-
-      // Bus deactivated -> no one can purchase a seat on it anymore.
-      const tripBus = Array.isArray(trip.buses) ? trip.buses[0] : trip.buses;
-      if (tripBus && tripBus.is_active === false) {
-        return res.status(400).json({
-          success: false,
-          error: 'Bus not available'
-        });
-      }
-
-      // Do not trust trips.available_seats here: sibling route segments may
-      // have different cached values. The physical bus is full only when all
-      // unique seats are occupied across its overlapping trip group.
-      const [{ data: occupiedTickets, error: occupiedTicketsError }, { data: activeHolds, error: activeHoldsError }] = await Promise.all([
-        client
-          .from('tickets')
-          .select('seat_number')
-          .in('trip_id', siblingIds)
-          .in('status', ['active', 'pending', 'used']),
-        client
-          .from('online_bookings')
-          .select('seat_number')
-          .in('trip_id', siblingIds)
-          .gt('expires_at', new Date().toISOString()),
-      ]);
-      if (occupiedTicketsError || activeHoldsError) throw occupiedTicketsError || activeHoldsError;
-      const occupiedSeats = new Set([
-        ...(occupiedTickets || []).map((row) => row.seat_number),
-        ...(activeHolds || []).map((row) => row.seat_number),
-      ]);
-      occupiedSeats.delete(COPILOT_SEAT_NUMBER);
-      const capacity = Number(tripBus?.capacity || 0);
-      if (!isSellableSeatNumber(normalizedSeatNumber, capacity)) {
-        return res.status(400).json({
-          error: 'Seat is outside the sellable passenger range',
-          details: `Seat must be between 2 and ${capacity}.`,
-        });
-      }
-      if (capacity - 1 <= occupiedSeats.size) {
-        return res.status(400).json({ error: 'No seats available' });
-      }
-
-      // Use seat_class from trip if not provided
-      const finalSeatClass = seatClass || trip.seat_class;
-
-      // Generate reference if needed (for non-cash payments with empty/null reference).
-      // TPA payments (full or split with cash) are settled immediately at the
-      // counter, so they follow the cash path: no ProxyPay reference, no SMS.
-      let initialReference = null;
-      let shouldUpdateReference = false;
-
-      if (!isCashLikePayment(paymentMethod)) {
-        if (!paymentReference || paymentReference.trim() === '') {
-          // Will generate and update after insert to trigger SMS
-          initialReference = null;
-          generatedReference = generateReferenceCode();
-          shouldUpdateReference = true;
-        } else {
-          initialReference = paymentReference;
-          generatedReference = paymentReference;
-          shouldUpdateReference = true;
-        }
-      } else {
-        // For cash-like payments, set reference immediately (no SMS trigger needed)
-        initialReference = paymentReference || `agent-${Date.now()}`;
-        generatedReference = initialReference;
-        shouldUpdateReference = false; // Don't trigger SMS for cash-like
-      }
-
-      // Newer clients can send the exact TPA/cash split in the original
-      // request. Older clients remain compatible and get one mixed-method row.
-      let normalizedSplits = [];
-      if (paymentMethod === 'tpa_dinheiro' && splits != null) {
-        try {
-          normalizedSplits = normalizePaymentSplits(splits, trip.price_usd);
-        } catch (splitError) {
-          return res.status(400).json({ error: splitError.message });
-        }
-      }
-
-      // Step 3: Create the ticket (with NULL reference if we need to trigger SMS)
-      const ticketInsertData = {
-        trip_id: tripId,
-        passenger_id: passengerId,
-        booked_by: bookedBy, // Agent who sold the ticket
-        booking_source: 'mobile_app', // Since this is for the separate app
-        seat_class: finalSeatClass,
-        seat_number: normalizedSeatNumber,
-        price_paid_usd: trip.price_usd,
-        payment_status: finalPaymentStatus,
-        payment_method: paymentMethod,
-        payment_reference: initialReference, // NULL for non-cash without reference
-        qr_code_data: `TKT-${tripId}-${normalizedSeatNumber}` // Simple QR data
-      };
-
-      // Add ticket_number if provided by client (hybrid approach)
-      if (ticketNumber) {
-        ticketInsertData.ticket_number = ticketNumber;
-      }
-
-      const { data: ticket, error: ticketError } = await client
-        .from('tickets')
-        .insert(ticketInsertData)
-        .select('id, ticket_number')
-        .single();
-
-      if (ticketError) throw ticketError;
-      ticketId = ticket.id;
-
-      // Step 3b: If we need to update reference to trigger SMS (non-cash only)
-      if (shouldUpdateReference && initialReference === null && generatedReference) {
-        const { error: updateError } = await client
-          .from('tickets')
-          .update({ payment_reference: generatedReference })
-          .eq('id', ticketId);
-
-        if (updateError) {
-          console.error('Failed to update payment reference:', updateError);
-          // Don't throw - ticket is created, just log the error
-        }
-      }
-
-      // Step 4: Create payment transaction record only for completed payments (cash-like)
-      if (isCashLikePayment(paymentMethod) && finalPaymentStatus === 'paid') {
-        const transactionSeed = randomUUID();
-        const paymentRows = normalizedSplits.length
-          ? normalizedSplits.map((split, index) => ({
-              ticket_id: ticketId,
-              amount_usd: split.amount,
-              currency: 'USD',
-              payment_method: split.method,
-              status: 'completed',
-              transaction_id: `agent-${transactionSeed}-${index}`,
-            }))
-          : [{
-              ticket_id: ticketId,
-              amount_usd: trip.price_usd,
-              currency: 'USD',
-              payment_method: paymentMethod,
-              status: 'completed',
-              transaction_id: `txn-${transactionSeed}`,
-            }];
-
-        const { error: paymentError } = await client
-          .from('payment_transactions')
-          .insert(paymentRows);
-
-        if (paymentError) {
-          // The client must never receive/print a paid ticket without its
-          // ledger entry. Compensate the earlier insert before returning an
-          // error; if deletion itself fails, leave the ticket pending so the
-          // scanner still fails closed and accounting can reconcile it.
-          const { error: deleteError } = await client
-            .from('tickets')
-            .delete()
-            .eq('id', ticketId);
-          if (deleteError) {
-            console.error('Failed to remove ticket after payment ledger failure:', deleteError);
-            await client
-              .from('tickets')
-              .update({ payment_status: 'pending' })
-              .eq('id', ticketId);
-          }
-          throw paymentError;
-        }
-      }
-
-      // Step 5: Update available seats (this should be handled by trigger, but let's ensure it)
-      await client.rpc('update_available_seats', {});
-
-      res.status(201).json({
-        success: true,
-        ticket: {
-          id: ticket.id,
-          trip_id: tripId,
-          seat_number: normalizedSeatNumber,
-          price_paid_usd: trip.price_usd,
-          qr_code_data: `TKT-${tripId}-${normalizedSeatNumber}`,
-          ticket_number: ticket.ticket_number,
-          payment_reference: generatedReference, // Return the reference number
-          payment_status: finalPaymentStatus,
-          payment_method: paymentMethod,
-        }
-      });
-
-    } catch (dbError) {
-      console.error('Booking transaction error:', dbError);
-      throw dbError;
-    }
-
+    const atomicRow = Array.isArray(data) ? data[0] : data;
+    const result = normalizeAtomicBookingResult(atomicRow);
+    return res.status(result.idempotent ? 200 : 201).json({
+      success: true,
+      idempotent: result.idempotent,
+      recovered: result.idempotent,
+      ticket: result.ticket,
+    });
   } catch (error) {
     console.error('Booking error:', error);
-    const status = error?.code === '23505' ? 409 : error?.code === '23514' ? 400 : 500;
-    res.status(status).json({ error: 'Booking failed', details: error.message });
+    const status = bookingErrorStatus(error);
+    const message = error?.code === '23505' && /seat/i.test(error.message || '')
+      ? 'Seat already taken'
+      : 'Booking failed';
+    return res.status(status).json({ error: message, details: error.message });
   }
 });
 
@@ -1218,9 +1039,6 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
       throw updateError;
     }
 
-    // Trigger seat update (though trigger should handle this automatically)
-    await client.rpc('update_available_seats', {});
-
     res.json({
       success: true,
       message: 'Ticket marked as paid',
@@ -1246,20 +1064,28 @@ app.get('/api/tickets/by-reference/:ref', async (req, res) => {
   try {
     const { ref } = req.params;
 
-    const { data: ticket, error } = await supabase
+    const { data: tickets, error } = await supabase
       .from('tickets')
-      .select('id, payment_status, trip_id, seat_number')
+      .select('id, ticket_number, trip_id, passenger_id, booked_by, seat_number, seat_class, price_paid_usd, payment_reference, payment_status, payment_method, qr_code_data, status')
       .eq('payment_reference', ref)
-      .single();
+      .limit(2);
 
     if (error) {
-      if (error.code === 'PGRST116') {
-        return res.json({ success: false, error: 'Not found' });
-      }
       return res.status(500).json({ success: false, error: error.message });
     }
 
-    res.json({ success: true, ticket });
+    if (!tickets?.length) {
+      return res.json({ success: false, error: 'Not found' });
+    }
+    if (tickets.length > 1) {
+      return res.status(409).json({
+        success: false,
+        error: 'Payment reference matches multiple tickets; use the booking idempotency key',
+        matches: tickets.map((ticket) => ticket.id),
+      });
+    }
+
+    res.json({ success: true, ticket: tickets[0] });
   } catch (error) {
     console.error('Ticket by reference error:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -1372,7 +1198,7 @@ app.patch('/api/tickets/:ticketId/update-status', async (req, res) => {
       success: true,
       ticket: {
         id: ticket.id,
-        payment_status: ticket.payment_status,
+        payment_status: 'paid',
         ticket_number: ticket.ticket_number
       }
     });

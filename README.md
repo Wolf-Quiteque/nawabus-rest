@@ -107,6 +107,7 @@ GET /api/routes?active=true
 #### Book a Trip
 ```
 POST /api/booking
+Idempotency-Key: <stable-client-request-id>
 ```
 
 Request Body:
@@ -116,10 +117,15 @@ Request Body:
   "passengerId": "passenger-uuid",
   "seatNumber": 15,
   "seatClass": "economy",
-  "paymentMethod": "card",
+  "paymentMethod": "cash",
   "paymentReference": "txn-12345"
 }
 ```
+
+The `Idempotency-Key` header is preferred. Existing terminal builds may use a
+stable `ticketNumber` or `paymentReference` in the request body instead. A
+retry returns the complete existing ticket with `idempotent: true`, allowing a
+safe reprint after a lost HTTP response.
 
 ### Payment
 
@@ -153,6 +159,11 @@ PORT=5000
 ```bash
 npm start
 ```
+
+Before deploying this API version, apply
+`supabase-migration-atomic-booking-and-batched-availability.sql`. The migration
+must land first: it installs the batched availability and atomic booking RPCs
+used by `server.js`.
 
 ## Database Schema
 
