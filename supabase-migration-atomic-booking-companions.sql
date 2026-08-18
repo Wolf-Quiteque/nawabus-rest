@@ -73,7 +73,12 @@ BEGIN
   IF p_companion_name IS NOT NULL THEN
     INSERT INTO public.ticket_companions (ticket_id, name, phone)
     VALUES (v_result.ticket_id, p_companion_name, p_companion_phone)
-    ON CONFLICT (ticket_id) DO NOTHING;
+    -- Do not name ticket_id as the conflict target here. The RETURNS TABLE
+    -- output variable has the same name, so PL/pgSQL treats
+    -- ON CONFLICT (ticket_id) as an ambiguous column reference at runtime.
+    -- There is only one unique key relevant to this insert, and the
+    -- verification below still rejects a retry with different traveller data.
+    ON CONFLICT DO NOTHING;
 
     -- A retry with the same idempotency key must describe the same traveller.
     IF NOT EXISTS (

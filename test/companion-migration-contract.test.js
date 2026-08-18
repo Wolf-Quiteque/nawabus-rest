@@ -20,7 +20,8 @@ test('ticket, payment and companion are committed through one RPC transaction', 
 });
 
 test('a retry cannot silently change the companion attached to a ticket', () => {
-  assert.match(sql, /ON CONFLICT \(ticket_id\) DO NOTHING/);
+  assert.match(sql, /ON CONFLICT DO NOTHING/);
+  assert.doesNotMatch(sql, /^\s*ON CONFLICT \(ticket_id\)/m);
   assert.match(sql, /Idempotency key already belongs to another companion/);
 });
 
