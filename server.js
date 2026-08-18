@@ -780,6 +780,8 @@ app.post('/api/booking', async (req, res) => {
       paymentStatus = 'pending',
       ticketNumber = null,
       splits = null,
+      companionName = null,
+      companionPhone = null,
     } = req.body;
 
     if (!tripId || !passengerId || seatNumber == null || !paymentMethod) {
@@ -818,6 +820,12 @@ app.post('/api/booking', async (req, res) => {
       return res.status(400).json({ error: 'Idempotency key must not exceed 200 characters' });
     }
 
+    const normalizedCompanionName = String(companionName || '').trim() || null;
+    const normalizedCompanionPhone = String(companionPhone || '').trim() || null;
+    if (normalizedCompanionPhone && !normalizedCompanionName) {
+      return res.status(400).json({ error: 'Companion phone requires a companion name' });
+    }
+
     let normalizedSplits = [];
     if (paymentMethod === 'tpa_dinheiro' && splits != null) {
       if (!Array.isArray(splits) || !splits.length) {
@@ -847,7 +855,7 @@ app.post('/api/booking', async (req, res) => {
         : generateReferenceCode()
     );
 
-    const { data, error } = await supabaseAdmin.rpc('book_agent_ticket_atomic', {
+    const { data, error } = await supabaseAdmin.rpc('book_agent_ticket_atomic_v2', {
       p_trip_id: tripId,
       p_passenger_id: passengerId,
       p_booked_by: auth.user.id,
@@ -859,6 +867,8 @@ app.post('/api/booking', async (req, res) => {
       p_payment_reference: finalReference,
       p_ticket_number: normalizedTicketNumber,
       p_splits: normalizedSplits,
+      p_companion_name: normalizedCompanionName,
+      p_companion_phone: normalizedCompanionPhone,
     });
     if (error) throw error;
 
