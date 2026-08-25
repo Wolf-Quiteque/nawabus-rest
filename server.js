@@ -782,6 +782,8 @@ app.post('/api/booking', async (req, res) => {
       splits = null,
       companionName = null,
       companionPhone = null,
+      promotionCode = null,
+      attributionSource = 'sunmi_counter',
     } = req.body;
 
     if (!tripId || !passengerId || seatNumber == null || !paymentMethod) {
@@ -855,7 +857,7 @@ app.post('/api/booking', async (req, res) => {
         : generateReferenceCode()
     );
 
-    const { data, error } = await supabaseAdmin.rpc('book_agent_ticket_atomic_v2', {
+    const { data, error } = await supabaseAdmin.rpc('book_agent_ticket_atomic_v3', {
       p_trip_id: tripId,
       p_passenger_id: passengerId,
       p_booked_by: auth.user.id,
@@ -869,6 +871,8 @@ app.post('/api/booking', async (req, res) => {
       p_splits: normalizedSplits,
       p_companion_name: normalizedCompanionName,
       p_companion_phone: normalizedCompanionPhone,
+      p_promotion_code: String(promotionCode || '').trim() || null,
+      p_attribution_source: String(attributionSource || '').trim() || 'sunmi_counter',
     });
     if (error) throw error;
 
@@ -1379,8 +1383,152 @@ app.post('/api/users/get-or-create', async (req, res) => {
   }
 });
 
-// GET /api/validate-coupon?code=XXXX - Validate a coupon code
+// POST /api/promotions/quote - Price a promotion against live trip fares.
+// The response deliberately omits the affiliate commission; that amount is an
+// internal liability and is persisted only when a ticket is created.
+app.post('/api/promotions/quote', async (req, res) => {
+  try {
+    const code = String(req.body?.code || '').trim().toUpperCase();
+    const requestedItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    const passengerId = String(req.body?.passengerId || '').trim() || null;
+
+    if (!code || requestedItems.length === 0 || requestedItems.length > 4) {
+      return res.status(400).json({
+        valid: false,
+        message: 'Informe o codigo e entre uma e quatro viagens.',
+      });
+    }
+
+    const items = requestedItems.map((item) => ({
+      tripId: String(item?.tripId || '').trim(),
+      seatCount: Number(item?.seatCount),
+    }));
+    const totalSeats = items.reduce((sum, item) => sum + item.seatCount, 0);
+    if (items.some((item) => !item.tripId || !Number.isInteger(item.seatCount) || item.seatCount < 1)
+        || totalSeats > 20) {
+      return res.status(400).json({
+        valid: false,
+        message: 'As viagens ou quantidades de lugares sao invalidas.',
+      });
+    }
+
+    const uniqueTripIds = [...new Set(items.map((item) => item.tripId))];
+    const { data: trips, error: tripError } = await supabaseAdmin
+      .from('trips')
+      .select('id, price_usd')
+      .in('id', uniqueTripIds);
+    if (tripError) throw tripError;
+
+    const fares = new Map((trips || []).map((trip) => [trip.id, Number(trip.price_usd)]));
+    if (fares.size !== uniqueTripIds.length) {
+      return res.status(404).json({ valid: false, message: 'Uma das viagens nao existe.' });
+    }
+
+    const quoteByTrip = new Map();
+    for (const tripId of uniqueTripIds) {
+      const { data, error } = await supabaseAdmin.rpc('resolve_promotion_for_ticket', {
+        p_code: code,
+        p_base_fare_kz: fares.get(tripId),
+        p_passenger_id: passengerId,
+      });
+      if (error) {
+        return res.status(400).json({
+          valid: false,
+          message: error.message || 'Codigo promocional invalido.',
+        });
+      }
+      const quote = Array.isArray(data) ? data[0] : data;
+      quoteByTrip.set(tripId, quote);
+    }
+
+    const quotedItems = items.map((item) => {
+      const quote = quoteByTrip.get(item.tripId);
+      const baseFare = fares.get(item.tripId);
+      return {
+        tripId: item.tripId,
+        seatCount: item.seatCount,
+        baseFareKz: baseFare,
+        discountPerTicketKz: Number(quote.passenger_discount_kz),
+        amountDuePerTicketKz: Number(quote.amount_due_kz),
+      };
+    });
+    const totals = quotedItems.reduce((result, item) => ({
+      baseAmountKz: result.baseAmountKz + (item.baseFareKz * item.seatCount),
+      discountAmountKz: result.discountAmountKz + (item.discountPerTicketKz * item.seatCount),
+      amountDueKz: result.amountDueKz + (item.amountDuePerTicketKz * item.seatCount),
+    }), { baseAmountKz: 0, discountAmountKz: 0, amountDueKz: 0 });
+    const firstQuote = quoteByTrip.values().next().value;
+
+    return res.json({
+      valid: true,
+      code: firstQuote.normalized_code,
+      kind: firstQuote.promotion_kind,
+      items: quotedItems,
+      totals,
+    });
+  } catch (error) {
+    console.error('Error quoting promotion:', error);
+    return res.status(500).json({ valid: false, message: 'Erro ao validar promocao.' });
+  }
+});
+
+// Compatibility endpoint for older clients that still validate before a trip
+// fare is available. New clients must use POST /api/promotions/quote.
 app.get('/api/validate-coupon', async (req, res) => {
+  try {
+    const code = String(req.query.code || '').trim().toUpperCase();
+    if (!code) {
+      return res.status(400).json({ valid: false, message: 'Codigo e obrigatorio.' });
+    }
+
+    const { data: coupon, error } = await supabaseAdmin
+      .from('coupons')
+      .select('id, code, discount_type, discount_percentage, discount_amount_kz, is_active, kind, affiliate_id, archived_at')
+      .eq('code', code)
+      .maybeSingle();
+    if (error) throw error;
+    if (!coupon || !coupon.is_active || coupon.archived_at) {
+      return res.json({ valid: false, message: 'Cupom invalido ou inactivo.' });
+    }
+
+    if (coupon.kind === 'affiliate') {
+      const { data: affiliate, error: affiliateError } = await supabaseAdmin
+        .from('affiliate_accounts')
+        .select('status, self_code_enabled, passenger_discount_kz')
+        .eq('user_id', coupon.affiliate_id)
+        .maybeSingle();
+      if (affiliateError) throw affiliateError;
+      if (!affiliate || affiliate.status !== 'approved' || !affiliate.self_code_enabled) {
+        return res.json({ valid: false, message: 'Este codigo de afiliado nao esta activo.' });
+      }
+      return res.json({
+        valid: true,
+        code: coupon.code,
+        discount_type: 'fixed_kz',
+        discount_amount_kz: Number(affiliate.passenger_discount_kz),
+      });
+    }
+
+    const response = {
+      valid: true,
+      code: coupon.code,
+      discount_type: coupon.discount_type || 'percentage',
+    };
+    if (response.discount_type === 'fixed_kz') {
+      response.discount_amount_kz = Number(coupon.discount_amount_kz);
+    } else {
+      response.discount_percentage = Number(coupon.discount_percentage);
+    }
+    return res.json(response);
+  } catch (error) {
+    console.error('Error validating coupon:', error);
+    return res.status(500).json({ valid: false, message: 'Erro ao validar cupom.' });
+  }
+});
+
+// Legacy implementation retained temporarily under a non-public route while
+// clients migrate to fare-aware promotion quotes.
+app.get('/api/validate-coupon-legacy', async (req, res) => {
   try {
     const code = (req.query.code || '').trim().toUpperCase();
 
@@ -1390,8 +1538,9 @@ app.get('/api/validate-coupon', async (req, res) => {
 
     const { data, error } = await supabase
       .from('coupons')
-      .select('id, code, discount_percentage, is_active')
+      .select('id, code, discount_type, discount_percentage, discount_amount_kz, is_active, kind')
       .eq('code', code)
+      .eq('kind', 'standard')
       .single();
 
     if (error || !data) {
@@ -1402,7 +1551,13 @@ app.get('/api/validate-coupon', async (req, res) => {
       return res.json({ valid: false, message: 'Este cupom está inactivo' });
     }
 
-    return res.json({ valid: true, discount_percentage: data.discount_percentage, code: data.code });
+    return res.json({
+      valid: true,
+      code: data.code,
+      discount_type: data.discount_type || 'percentage',
+      discount_percentage: data.discount_type === 'fixed_kz' ? null : Number(data.discount_percentage),
+      discount_amount_kz: data.discount_type === 'fixed_kz' ? Number(data.discount_amount_kz) : null,
+    });
   } catch (error) {
     console.error('Error validating coupon:', error);
     res.status(500).json({ valid: false, message: 'Erro ao validar cupom' });
@@ -1411,6 +1566,7 @@ app.get('/api/validate-coupon', async (req, res) => {
 
 // POST /api/mobile/booking - Create booking for mobile app with payment reference
 app.post('/api/mobile/booking', async (req, res) => {
+  const createdTicketIds = [];
   try {
     const {
       outboundTrip,
@@ -1429,77 +1585,110 @@ app.post('/api/mobile/booking', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    if ([...(outboundSeats || []), ...(returnSeats || [])].some(isCopilotSeat)) {
+    if (paymentMethod !== 'referencia') {
+      return res.status(400).json({ error: 'Mobile bookings require referencia payment' });
+    }
+
+    const requestedSeats = [...(outboundSeats || []), ...(returnSeats || [])];
+    if (requestedSeats.some((seat) => !Number.isInteger(Number(seat)) || Number(seat) < 2)
+        || new Set((outboundSeats || []).map(Number)).size !== outboundSeats.length
+        || (returnSeats && new Set(returnSeats.map(Number)).size !== returnSeats.length)) {
+      return res.status(400).json({ error: 'Invalid or duplicated seat number' });
+    }
+
+    const bearerToken = String(req.get('Authorization') || '').replace(/^Bearer\s+/i, '').trim();
+    const { data: authData, error: authError } = bearerToken
+      ? await supabaseAdmin.auth.getUser(bearerToken)
+      : { data: null, error: new Error('Missing bearer token') };
+    if (authError || !authData?.user || authData.user.id !== passengerId) {
+      return res.status(401).json({ error: 'Authenticated passenger does not match booking' });
+    }
+
+    if (requestedSeats.some(isCopilotSeat)) {
       return res.status(400).json({
         error: 'Seat reserved for the co-pilot',
         details: `Seat ${COPILOT_SEAT_NUMBER} is always reserved for the co-pilot and cannot be sold.`
       });
     }
 
-    // Validate coupon if provided
-    let discountFactor = 1;
-    if (couponCode) {
-      const normalizedCode = couponCode.trim().toUpperCase();
-      const { data: coupon } = await supabase
-        .from('coupons')
-        .select('discount_percentage, is_active')
-        .eq('code', normalizedCode)
+    const normalizedCode = String(couponCode || '').trim().toUpperCase() || null;
+    const source = normalizedCode ? 'mobile_code' : null;
+    const requestedTrips = [
+      { input: outboundTrip, seats: outboundSeats },
+      ...(returnTrip && returnSeats?.length ? [{ input: returnTrip, seats: returnSeats }] : []),
+    ];
+    const pricedTrips = [];
+
+    for (const requested of requestedTrips) {
+      const { data: tripRow, error: tripError } = await supabaseAdmin
+        .from('trips')
+        .select('id, price_usd, seat_class')
+        .eq('id', requested.input.id)
         .single();
-      if (coupon && coupon.is_active) {
-        discountFactor = 1 - coupon.discount_percentage / 100;
+      if (tripError || !tripRow) {
+        return res.status(404).json({ error: 'Trip not found' });
       }
+
+      let quote = null;
+      if (normalizedCode) {
+        const { data: quoteData, error: quoteError } = await supabaseAdmin.rpc(
+          'resolve_promotion_for_ticket',
+          {
+            p_code: normalizedCode,
+            p_base_fare_kz: Number(tripRow.price_usd),
+            p_passenger_id: passengerId,
+          }
+        );
+        if (quoteError) {
+          return res.status(400).json({ error: quoteError.message || 'Invalid promotion code' });
+        }
+        quote = Array.isArray(quoteData) ? quoteData[0] : quoteData;
+      }
+      pricedTrips.push({ ...requested, trip: tripRow, quote });
     }
 
-    const ticketIds = [];
+    const ticketIds = createdTicketIds;
     let totalAmount = 0;
+    let totalBaseAmount = 0;
+    let totalDiscountAmount = 0;
+    let totalCommissionAmount = 0;
 
-    // Create outbound tickets
-    for (const seatNumber of outboundSeats) {
-      const { data: ticket, error } = await supabase
-        .from('tickets')
-        .insert({
-          trip_id: outboundTrip.id,
-          passenger_id: passengerId,
-          booked_by: passengerId,
-          booking_source: 'mobile_app',
-          seat_class: outboundTrip.seat_class || 'economy',
-          seat_number: seatNumber,
-          price_paid_usd: parseFloat((outboundTrip.price_usd * discountFactor).toFixed(2)),
-          payment_status: 'pending',
-          payment_method: paymentMethod || 'referencia',
-          qr_code_data: `TKT-${outboundTrip.id}-${seatNumber}`
-        })
-        .select('id, ticket_number, price_paid_usd')
-        .single();
+    for (const priced of pricedTrips) {
+      const baseFare = Number(priced.trip.price_usd);
+      const amountDue = Number(priced.quote?.amount_due_kz ?? baseFare);
+      const discount = Number(priced.quote?.passenger_discount_kz || 0);
+      const commission = Number(priced.quote?.commission_amount_kz || 0);
 
-      if (error) throw error;
-      ticketIds.push(ticket.id);
-      totalAmount += ticket.price_paid_usd;
-    }
-
-    // Create return tickets if round trip
-    if (returnTrip && returnSeats && returnSeats.length > 0) {
-      for (const seatNumber of returnSeats) {
-        const { data: ticket, error } = await supabase
+      for (const seatNumber of priced.seats) {
+        const { data: ticket, error } = await supabaseAdmin
           .from('tickets')
           .insert({
-            trip_id: returnTrip.id,
+            trip_id: priced.trip.id,
             passenger_id: passengerId,
             booked_by: passengerId,
             booking_source: 'mobile_app',
-            seat_class: returnTrip.seat_class || 'economy',
+            seat_class: priced.trip.seat_class || 'economy',
             seat_number: seatNumber,
-            price_paid_usd: parseFloat((returnTrip.price_usd * discountFactor).toFixed(2)),
+            price_paid_usd: amountDue,
+            promotion_code_id: priced.quote?.promotion_code_id || null,
+            promotion_code_snapshot: priced.quote?.normalized_code || null,
+            base_fare_kz: baseFare,
+            passenger_discount_kz: discount,
+            affiliate_commission_kz: commission,
+            attribution_source: priced.quote ? source : null,
             payment_status: 'pending',
             payment_method: paymentMethod || 'referencia',
-            qr_code_data: `TKT-${returnTrip.id}-${seatNumber}`
+            qr_code_data: `TKT-${priced.trip.id}-${seatNumber}`
           })
           .select('id, ticket_number, price_paid_usd')
           .single();
 
         if (error) throw error;
         ticketIds.push(ticket.id);
-        totalAmount += ticket.price_paid_usd;
+        totalAmount += Number(ticket.price_paid_usd);
+        totalBaseAmount += baseFare;
+        totalDiscountAmount += discount;
+        totalCommissionAmount += commission;
       }
     }
 
@@ -1527,16 +1716,32 @@ app.post('/api/mobile/booking', async (req, res) => {
           paymentReference = paymentData.reference_number || paymentData.reference;
 
           // Update all tickets with the payment reference
-          for (const ticketId of ticketIds) {
-            await supabase
-              .from('tickets')
-              .update({ payment_reference: paymentReference })
-              .eq('id', ticketId);
+          const { error: referenceError } = await supabaseAdmin
+            .from('tickets')
+            .update({ payment_reference: paymentReference })
+            .in('id', ticketIds);
+          if (referenceError) throw referenceError;
+
+          if (normalizedCode) {
+            const { error: transactionPromotionError } = await supabaseAdmin
+              .from('payment_transactions')
+              .update({
+                promotion_code_id: pricedTrips[0].quote.promotion_code_id,
+                base_amount_kz: totalBaseAmount,
+                discount_amount_kz: totalDiscountAmount,
+                affiliate_commission_kz: totalCommissionAmount,
+                attribution_source: source,
+              })
+              .eq('transaction_id', paymentReference);
+            if (transactionPromotionError) throw transactionPromotionError;
           }
+        } else {
+          const paymentErrorBody = await paymentResponse.text();
+          throw new Error(`Payment reference failed: ${paymentErrorBody}`);
         }
       } catch (paymentError) {
         console.error('Payment reference generation failed:', paymentError);
-        // Continue without reference - tickets are already created
+        throw paymentError;
       }
     }
 
@@ -1551,6 +1756,13 @@ app.post('/api/mobile/booking', async (req, res) => {
 
   } catch (error) {
     console.error('Mobile booking error:', error);
+    if (createdTicketIds.length > 0) {
+      const { error: cleanupError } = await supabaseAdmin
+        .from('tickets')
+        .delete()
+        .in('id', createdTicketIds);
+      if (cleanupError) console.error('Mobile booking cleanup failed:', cleanupError);
+    }
     res.status(500).json({ error: 'Booking failed', details: error.message });
   }
 });

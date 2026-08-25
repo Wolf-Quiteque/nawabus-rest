@@ -60,6 +60,24 @@ test('lost-response retry returns the complete existing ticket shape for reprint
   });
 });
 
+test('promotion-aware bookings include the immutable fare snapshot', () => {
+  const result = normalizeAtomicBookingResult({
+    ...recoveredRow,
+    base_fare_kz: '10000.00',
+    passenger_discount_kz: '500.00',
+    affiliate_commission_kz: '500.00',
+    promotion_code: 'MARIA500',
+    attribution_source: 'sunmi_counter',
+  });
+
+  assert.equal(result.ticket.price_paid_usd, 10000);
+  assert.equal(result.ticket.base_fare_kz, 10000);
+  assert.equal(result.ticket.passenger_discount_kz, 500);
+  assert.equal(result.ticket.affiliate_commission_kz, 500);
+  assert.equal(result.ticket.promotion_code, 'MARIA500');
+  assert.equal(result.ticket.attribution_source, 'sunmi_counter');
+});
+
 test('atomic seat conflicts are 409 while invalid seats are 400', () => {
   assert.equal(bookingErrorStatus({ code: '23505' }), 409);
   assert.equal(bookingErrorStatus({ code: '23514' }), 400);
