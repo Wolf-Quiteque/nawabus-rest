@@ -82,3 +82,10 @@ test('atomic seat conflicts are 409 while invalid seats are 400', () => {
   assert.equal(bookingErrorStatus({ code: '23505' }), 409);
   assert.equal(bookingErrorStatus({ code: '23514' }), 400);
 });
+
+test('a trip sales cap reached during a concurrent sale is a conflict', () => {
+  assert.equal(
+    bookingErrorStatus({ code: 'P0001', message: 'Trip sales limit reached (30 tickets)' }),
+    409,
+  );
+});

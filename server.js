@@ -889,7 +889,9 @@ app.post('/api/booking', async (req, res) => {
     const status = bookingErrorStatus(error);
     const message = error?.code === '23505' && /seat/i.test(error.message || '')
       ? 'Seat already taken'
-      : 'Booking failed';
+      : error?.code === 'P0001' && /sales limit/i.test(error.message || '')
+        ? 'Trip sales limit reached'
+        : 'Booking failed';
     return res.status(status).json({ error: message, details: error.message });
   }
 });
