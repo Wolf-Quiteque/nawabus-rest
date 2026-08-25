@@ -4,6 +4,11 @@ import { readFile } from 'node:fs/promises';
 
 const migrationUrl = new URL('../../admin-app/supabase/migrations/20260821_affiliate_program.sql', import.meta.url);
 const sql = await readFile(migrationUrl, 'utf8');
+const bookingHotfixUrl = new URL(
+  '../../admin-app/supabase/migrations/20260825_fix_atomic_booking_v3_without_promotion.sql',
+  import.meta.url
+);
+const bookingHotfixSql = await readFile(bookingHotfixUrl, 'utf8');
 
 test('affiliate applications remain separate from the existing single profile role', () => {
   assert.match(sql, /CREATE TABLE IF NOT EXISTS public\.affiliate_accounts/);
@@ -24,6 +29,23 @@ test('tickets retain the financial and attribution snapshots used by reports', (
   assert.match(sql, /ADD COLUMN IF NOT EXISTS affiliate_commission_kz numeric/);
   assert.match(sql, /ADD COLUMN IF NOT EXISTS attribution_source text/);
   assert.match(sql, /price_paid_usd = v_final_fare/);
+});
+
+test('counter bookings without a promotion never dereference an unassigned quote record', () => {
+  for (const migrationSql of [sql, bookingHotfixSql]) {
+    assert.match(
+      migrationSql,
+      /IF v_has_promotion THEN[\s\S]*promotion_code_id = v_quote\.promotion_code_id/
+    );
+    assert.match(
+      migrationSql,
+      /ELSE[\s\S]*promotion_code_id = NULL[\s\S]*passenger_discount_kz = 0/
+    );
+    assert.doesNotMatch(
+      migrationSql,
+      /promotion_code_id = CASE WHEN v_has_promotion THEN v_quote\.promotion_code_id/
+    );
+  }
 });
 
 test('paid tickets earn once and cancelled or refunded tickets reverse once', () => {
