@@ -200,8 +200,10 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
-    // Use Supabase auth to sign in
-    const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+    // Auth clients keep session state internally. Use one client per request so
+    // simultaneous terminals can never overwrite each other's auth session.
+    const authClient = createRequestAuthClient();
+    const { data: authData, error: authError } = await authClient.auth.signInWithPassword({
       email: email.trim(),
       password: password
     });
@@ -215,7 +217,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     // Get additional user profile information
-    const { data: profile, error: profileError } = await supabase
+    const { data: profile, error: profileError } = await authClient
       .from('profiles')
       .select('*')
       .eq('id', authData.user.id)
@@ -263,7 +265,10 @@ app.post('/api/auth/refresh', async (req, res) => {
       });
     }
 
-    const { data, error } = await supabase.auth.refreshSession({ refresh_token });
+    // A shared Supabase client can rotate the wrong in-memory session when
+    // several machines refresh at once. Isolate every refresh request.
+    const authClient = createRequestAuthClient();
+    const { data, error } = await authClient.auth.refreshSession({ refresh_token });
 
     if (error) {
       console.error('Token refresh error:', error);
