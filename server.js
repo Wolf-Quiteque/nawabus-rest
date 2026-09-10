@@ -20,6 +20,7 @@ import {
   normalizeAtomicBookingResult,
   resolveIdempotencyKey,
 } from './lib/booking-response.js';
+import { buildManifestRows, parseManifestQuery } from './lib/manifest.js';
 
 dotenv.config();
 
@@ -1227,6 +1228,93 @@ app.patch('/api/tickets/:ticketId/update-status', async (req, res) => {
   } catch (error) {
     console.error('Update ticket status error:', error);
     res.status(500).json({ error: 'Internal server error', details: error.message });
+  }
+});
+
+// GET /api/manifest - Live passenger manifest for one Luanda day, scoped to
+// one agency (or "Todos" for every agency). Reads current ticket state
+// straight from the DB, so a reschedule/edit made anywhere (admin-app,
+// website, another terminal) shows up here immediately - no per-device
+// history file involved.
+app.get('/api/manifest', async (req, res) => {
+  try {
+    const auth = await authenticateAgentRequest(req);
+    if (auth.error) {
+      return res.status(auth.status).json({ success: false, error: auth.error });
+    }
+
+    let query;
+    try {
+      query = parseManifestQuery(req.query);
+    } catch (parseError) {
+      return res.status(400).json({ success: false, error: parseError.message });
+    }
+
+    const { data: tickets, error } = await supabaseAdmin
+      .from('tickets')
+      .select(`
+        id,
+        ticket_number,
+        trip_id,
+        passenger_id,
+        seat_number,
+        price_paid_usd,
+        payment_method,
+        payment_status,
+        status,
+        booking_source,
+        payment_reference,
+        companions:ticket_companions ( name, phone ),
+        trip:trips!inner (
+          departure_time,
+          route:routes ( origin_city, destination_city ),
+          bus:buses ( license_plate )
+        )
+      `)
+      // Manifest is a boarding list: only tickets a passenger can still board
+      // on ('active') or already boarded with ('used'). Cancelled/refunded
+      // tickets are excluded (tickets_status_check: active|used|cancelled|refunded).
+      .in('status', ['active', 'used'])
+      .gte('trip.departure_time', query.startIso)
+      .lt('trip.departure_time', query.endIso);
+
+    if (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    // Agency scoping happens here in JS (rather than as a DB filter) because
+    // it is a filter on a twice-nested embed (ticket -> trip -> route), and
+    // a day's ticket volume is small enough that this is simplest and safest.
+    const scopedTickets = query.agency === 'Todos'
+      ? (tickets || [])
+      : (tickets || []).filter((ticket) => ticket.trip?.route?.origin_city === query.agency);
+
+    const tripsById = new Map();
+    const profileIds = new Set();
+    for (const ticket of scopedTickets) {
+      if (ticket.trip_id && ticket.trip) tripsById.set(ticket.trip_id, ticket.trip);
+      if (ticket.passenger_id) profileIds.add(ticket.passenger_id);
+    }
+
+    const profilesById = new Map();
+    if (profileIds.size) {
+      const { data: profiles, error: profileError } = await supabaseAdmin
+        .from('profiles')
+        .select('id, first_name, last_name, phone_number')
+        .in('id', Array.from(profileIds));
+      if (profileError) {
+        return res.status(500).json({ success: false, error: profileError.message });
+      }
+      for (const profile of profiles || []) {
+        profilesById.set(profile.id, profile);
+      }
+    }
+
+    const rows = buildManifestRows({ tickets: scopedTickets, tripsById, profilesById });
+    res.json({ success: true, date: query.date, agency: query.agency, rows });
+  } catch (error) {
+    console.error('Manifest error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
