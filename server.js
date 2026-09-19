@@ -408,7 +408,7 @@ app.get('/api/auth/me', async (req, res) => {
     }
 
     // Get user profile
-    const { data: profile, error: profileError } = await supabase
+    const { data: profile, error: profileError } = await supabaseAdmin
       .from('profiles')
       .select('*')
       .eq('id', user.id)
@@ -904,7 +904,9 @@ app.post('/api/booking', async (req, res) => {
 
 // PATCH /api/tickets/:ticketId/mark-paid - Legacy compatibility for older Sunmi builds.
 app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
-  const client = supabase;
+  // Service key: this route authenticates the agent itself (role and
+  // ownership are checked below), and clients may not write tickets.
+  const client = supabaseAdmin;
   try {
     // Verify authentication
     const authHeader = req.headers.authorization;
@@ -926,7 +928,7 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
     }
 
     // Check agent role
-    const { data: profile, error: profileError } = await supabase
+    const { data: profile, error: profileError } = await supabaseAdmin
       .from('profiles')
       .select('role')
       .eq('id', user.id)
@@ -1086,7 +1088,7 @@ app.get('/api/tickets/by-reference/:ref', async (req, res) => {
   try {
     const { ref } = req.params;
 
-    const { data: tickets, error } = await supabase
+    const { data: tickets, error } = await supabaseAdmin
       .from('tickets')
       .select('id, ticket_number, trip_id, passenger_id, booked_by, seat_number, seat_class, price_paid_usd, payment_reference, payment_status, payment_method, qr_code_data, status')
       .eq('payment_reference', ref)
@@ -1335,7 +1337,7 @@ app.post('/api/users/get-or-create', async (req, res) => {
     }
 
     // 1. Search for an existing passenger by normalized phone and common legacy variants.
-    const { data: existingProfiles, error: profileError } = await supabase
+    const { data: existingProfiles, error: profileError } = await supabaseAdmin
       .from('profiles')
       .select('id, phone_number, role')
       .in('phone_number', phoneVariants)
@@ -1434,7 +1436,7 @@ app.post('/api/users/get-or-create', async (req, res) => {
           return res.json({ success: true, userId: signInData.user.id });
         }
 
-        const { data: retryProfiles, error: retryProfileError } = await supabase
+        const { data: retryProfiles, error: retryProfileError } = await supabaseAdmin
           .from('profiles')
           .select('id, phone_number')
           .in('phone_number', phoneVariants)
@@ -1631,7 +1633,7 @@ app.get('/api/validate-coupon-legacy', async (req, res) => {
       return res.status(400).json({ valid: false, message: 'Código é obrigatório' });
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAdmin
       .from('coupons')
       .select('id, code, discount_type, discount_percentage, discount_amount_kz, is_active, kind')
       .eq('code', code)
