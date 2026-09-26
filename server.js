@@ -903,6 +903,50 @@ app.post('/api/booking', async (req, res) => {
 });
 
 // PATCH /api/tickets/:ticketId/mark-paid - Legacy compatibility for older Sunmi builds.
+/**
+ * Turns one lumped `tpa_dinheiro` payment row into the two rows it really was.
+ *
+ * Only touches a ledger that is exactly one completed lump for the full price:
+ * a ticket already split, or paid any other way, is left alone. The new rows go
+ * in before the lump comes out, and if the delete fails they are removed again,
+ * so the ledger is never short.
+ */
+async function splitLumpedAgentPayment({ client, ticketId, price, existing, parts }) {
+  if (!parts?.length) return false;
+  if (!Array.isArray(existing) || existing.length !== 1) return false;
+  const lump = existing[0];
+  if (lump.payment_method !== 'tpa_dinheiro') return false;
+  if (Math.abs(Number(lump.amount_usd) - Number(price)) > 0.01) return false;
+
+  const seed = randomUUID();
+  const { data: inserted, error: insertError } = await client
+    .from('payment_transactions')
+    .insert(parts.map((part, i) => ({
+      ticket_id: ticketId,
+      amount_usd: Number(part.amount),
+      currency: 'USD',
+      payment_method: part.method,
+      status: 'completed',
+      transaction_id: `agent-${seed}-${i}`,
+    })))
+    .select('id');
+  if (insertError) {
+    console.error('Failed to write split payment rows:', insertError);
+    return false;
+  }
+
+  const { error: deleteError } = await client
+    .from('payment_transactions')
+    .delete()
+    .eq('id', lump.id);
+  if (deleteError) {
+    console.error('Failed to remove lumped payment row, undoing the split:', deleteError);
+    await client.from('payment_transactions').delete().in('id', (inserted || []).map((r) => r.id));
+    return false;
+  }
+  return true;
+}
+
 app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
   // Service key: this route authenticates the agent itself (role and
   // ownership are checked below), and clients may not write tickets.
@@ -965,7 +1009,7 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
 
     const { data: existingTransactions, error: existingError } = await client
       .from('payment_transactions')
-      .select('id')
+      .select('id, amount_usd, payment_method')
       .eq('ticket_id', ticketId)
       .eq('status', 'completed');
     if (existingError) throw existingError;
@@ -975,11 +1019,32 @@ app.patch('/api/tickets/:ticketId/mark-paid', async (req, res) => {
     // completed ledger row as an idempotent success.
     if (ticket.payment_status === 'paid') {
       if (existingTransactions?.length) {
+        // The booking already settled this ticket, but a TPA & Dinheiro sale
+        // arrives here as one lump `tpa_dinheiro` row, which counts as neither
+        // cash nor TPA in any report. The app tells us the two amounts, so
+        // split that row now — same total, finally attributable.
+        let splitsApplied = false;
+        if (splits != null) {
+          let parts;
+          try {
+            parts = normalizePaymentSplits(splits, ticket.price_paid_usd);
+          } catch (splitError) {
+            return res.status(400).json({ error: splitError.message });
+          }
+          splitsApplied = await splitLumpedAgentPayment({
+            client,
+            ticketId,
+            price: ticket.price_paid_usd,
+            existing: existingTransactions,
+            parts,
+          });
+        }
         return res.json({
           success: true,
           message: 'Ticket already marked as paid',
           ticket_id: ticketId,
           already_paid: true,
+          splits_applied: splitsApplied,
         });
       }
       return res.status(409).json({
