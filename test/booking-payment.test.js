@@ -34,8 +34,10 @@ test('booking payment methods are explicitly allow-listed', () => {
 test('seat numbers must be integer passenger seats inside bus capacity', () => {
   assert.equal(normalizeSeatNumber('24'), 24);
   assert.equal(normalizeSeatNumber('2.5'), null);
-  assert.equal(isSellableSeatNumber(1, 51), false);
+  assert.equal(isSellableSeatNumber(1, 51), true);
   assert.equal(isSellableSeatNumber(2, 51), true);
+  assert.equal(isSellableSeatNumber(3, 51), false);
+  assert.equal(isSellableSeatNumber(2, 51, 2), false);
   assert.equal(isSellableSeatNumber(51, 51), true);
   assert.equal(isSellableSeatNumber(52, 51), false);
 });

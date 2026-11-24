@@ -13,11 +13,11 @@ test('overlapping trips share unique passenger seats', () => {
     ticketRows: [
       { trip_id: 'segment-a', seat_number: 2, status: 'active' },
       { trip_id: 'segment-b', seat_number: 2, status: 'used' },
-      { trip_id: 'segment-b', seat_number: 3, status: 'active' },
+      { trip_id: 'segment-b', seat_number: 4, status: 'active' },
     ],
   });
 
-  assert.deepEqual(result.occupiedSeats, [2, 3]);
+  assert.deepEqual(result.occupiedSeats, [2, 4]);
   assert.equal(result.availableSeats, 3);
 });
 
@@ -36,19 +36,19 @@ test('active holds occupy seats while expired holds do not', () => {
   assert.equal(result.availableSeats, 3);
 });
 
-test('cancelled/refunded tickets do not occupy and co-pilot is excluded once', () => {
+test('cancelled/refunded tickets do not occupy and seat 3 is excluded once', () => {
   const result = calculateSeatAvailability({
     capacity: 4,
     ticketRows: [
       { seat_number: 1, status: 'active' },
       { seat_number: 2, status: 'cancelled' },
-      { seat_number: 3, status: 'refunded' },
+      { seat_number: 3, status: 'active' },
       { seat_number: 4, status: 'used' },
     ],
   });
 
-  assert.deepEqual(result.occupiedSeats, [4]);
-  assert.equal(result.availableSeats, 2);
+  assert.deepEqual(result.occupiedSeats, [1, 4]);
+  assert.equal(result.availableSeats, 1);
 });
 
 test('full bus calculation never becomes negative', () => {

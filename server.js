@@ -9,6 +9,7 @@ import {
   normalizeSeatNumber,
   normalizePaymentSplits,
   resolveBookingPaymentStatus,
+  COPILOT_SEAT_NUMBER,
 } from './lib/booking-payment.js';
 import {
   applyAvailabilityRows,
@@ -53,12 +54,8 @@ const supabaseAdmin = supabaseServiceRoleKey
   : supabase;
 
 /**
- * Seat 1 is permanently reserved for the co-pilot and can never be sold.
- * Mirrors public.copilot_seat_number() in the database, which rejects any
- * ticket written to this seat. Keep the two in sync.
+ * The database's copilot_seat_number() is the authoritative booking guard.
  */
-const COPILOT_SEAT_NUMBER = 1;
-
 function isCopilotSeat(seatNumber) {
   return Number(seatNumber) === COPILOT_SEAT_NUMBER;
 }
